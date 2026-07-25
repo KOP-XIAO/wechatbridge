@@ -15,7 +15,15 @@ from io import StringIO
 
 from .config import config
 from .ilink import ILinkClient
-from .runner_common import get_session_dir, is_dangerous, load_prefs, save_prefs
+from .runner_common import (
+    format_error,
+    format_model_label,
+    get_session_dir,
+    is_dangerous,
+    load_prefs,
+    save_prefs,
+    switch_backend_prefs,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -77,32 +85,41 @@ async def _handle_slash(text: str, user_id: str) -> str | None:
 def _cmd_backend(args: str, user_id: str) -> str:
     """Handle /backend <agy|grok> — switch CLI backend per user.
 
-    Switching resets the conversation (.initialized flag) so the new
+    Switching restores that backend's remembered model/effort/mode (or empty
+    project default on first visit), and resets the conversation so the new
     backend starts a fresh session.
     """
     name = args.strip().lower()
     if not name:
-        current = _get_backend(user_id)
+        prefs = load_prefs(user_id)
+        current = prefs.get("backend", config.backend)
+        model_label = format_model_label(prefs.get("model", ""))
         return (
-            f"📋 **当前后端** 📋\n\n`{current}`\n\n"
+            f"📋 **当前后端** 📋\n\n`{current}`\n"
+            f"模型: `{model_label}`\n\n"
             "用法: `/backend agy` 或 `/backend grok`"
         )
     if name not in ("agy", "grok"):
         return "❌ **未知后端** ❌\n\n支持: `agy` / `grok`\n\n`/backend agy` 或 `/backend grok`"
     prefs = load_prefs(user_id)
-    old = prefs.get("backend", config.backend)
-    prefs["backend"] = name
+    old, new = switch_backend_prefs(prefs, name)
     save_prefs(user_id, prefs)
-    # Reset session so new backend starts fresh
-    session_dir = get_session_dir(user_id)
-    flag = os.path.join(session_dir, ".initialized")
-    if os.path.exists(flag):
-        os.remove(flag)
-    if old == name:
-        return f"📋 **当前后端** 📋\n\n`{name}`（未变化）"
+    model_label = format_model_label(prefs.get("model", ""))
+    # Reset session so new backend starts fresh (only when actually changed)
+    if old != new:
+        session_dir = get_session_dir(user_id)
+        flag = os.path.join(session_dir, ".initialized")
+        if os.path.exists(flag):
+            os.remove(flag)
+        return (
+            f"✅ **后端已切换** ✅\n\n"
+            f"`{old}` → `{new}`\n"
+            f"模型: `{model_label}`\n\n"
+            "⚠️ 对话已重置，新后端将开始新会话。"
+        )
     return (
-        f"✅ **后端已切换** ✅\n\n`{old}` → `{name}`\n\n"
-        "⚠️ 对话已重置，新后端将开始新会话。"
+        f"📋 **当前后端** 📋\n\n`{name}`（未变化）\n"
+        f"模型: `{model_label}`"
     )
 
 
@@ -407,7 +424,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
 
         except Exception as e:
             logger.exception("图片下载/解密失败: %s", e)
-            reply = f"❌ **图片下载或解密失败** ❌\n\n```\n{e}\n```"
+            reply = format_error("图片下载或解密失败", str(e))
 
     # ---- Case 1.5: Message contains a file (non-image) ----
     elif file_media and file_media.get("aes_key"):
@@ -437,7 +454,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
 
         except Exception as e:
             logger.exception("文件下载/解密失败: %s", e)
-            reply = f"❌ **文件下载或解密失败** ❌\n\n```\n{e}\n```"
+            reply = format_error("文件下载或解密失败", str(e))
 
     # ---- Case 1.6: Voice message (text transcription passthrough) ----
     elif has_voice:

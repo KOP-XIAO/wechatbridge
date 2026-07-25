@@ -17,7 +17,8 @@ from .config import config
 from .runner_common import (
     sanitize_user_id, get_session_dir, is_first_message, mark_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
-    sanitize_env, terminate_process,
+    sanitize_env, terminate_process, update_active_prefs,
+    format_error, format_cli_error, EMPTY_REPLY,
 )
 
 logger = logging.getLogger("grok_runner")
@@ -27,26 +28,75 @@ logger = logging.getLogger("grok_runner")
 # Per-user .grok directory setup
 # ---------------------------------------------------------------------------
 
+def _host_grok_dir() -> str:
+    """Host-level ~/.grok (bridge process home), not the per-user session HOME.
+
+    Auth/login is machine-wide; conversation state stays under the session dir.
+    Override with WECHATBRIDGE_HOST_HOME if the service home is not the login home.
+    """
+    host_home = os.environ.get("WECHATBRIDGE_HOST_HOME") or os.path.expanduser("~")
+    return os.path.join(host_home, ".grok")
+
+
+def _sync_grok_auth(grok_dir: str) -> bool:
+    """Make session .grok/auth.json track the host login credentials.
+
+    Bug fixed: we used to copy auth.json only once. Token refresh updates the
+    host ~/.grok/auth.json, while the session kept a stale/missing copy →
+    false "Not signed in" even when host login is still valid.
+
+    Strategy: symlink session auth.json → host auth.json (shared refresh).
+    Fall back to copy2 if symlink is not possible.
+    Returns True if credentials are available for the child process.
+    """
+    auth_src = os.path.join(_host_grok_dir(), "auth.json")
+    auth_dst = os.path.join(grok_dir, "auth.json")
+
+    if not os.path.isfile(auth_src):
+        logger.warning("Host grok auth missing: %s", auth_src)
+        return False
+
+    try:
+        src_real = os.path.realpath(auth_src)
+        if os.path.islink(auth_dst) or os.path.exists(auth_dst):
+            try:
+                if os.path.realpath(auth_dst) == src_real and os.path.isfile(auth_dst):
+                    return True
+            except OSError:
+                pass
+            try:
+                os.unlink(auth_dst)
+            except OSError:
+                # Windows or busy file — try overwrite via copy below
+                pass
+
+        try:
+            os.symlink(src_real, auth_dst)
+            logger.info("Linked session auth.json -> %s", src_real)
+            return True
+        except OSError as e:
+            logger.warning("symlink auth.json failed (%s), falling back to copy", e)
+            shutil.copy2(auth_src, auth_dst)
+            os.chmod(auth_dst, 0o600)
+            return True
+    except OSError as e:
+        logger.warning("Failed to sync auth.json into %s: %s", grok_dir, e)
+        return False
+
+
 def ensure_user_grok(user_id: str) -> str:
     """Ensure per-user .grok directory with auth credentials.
 
-    Creates session/.grok/ for grok config, auth, and conversations.
-    Copies global auth.json on first use.
+    Creates session/.grok/ for grok config and conversations.
+    Always syncs host auth.json (symlink preferred) so login state matches
+    the machine-level `grok login`, not a stale one-shot copy.
     Returns session_dir path (for use as HOME when running grok).
     """
     session_dir = get_session_dir(user_id)
     grok_dir = os.path.join(session_dir, ".grok")
     os.makedirs(grok_dir, exist_ok=True)
 
-    # Copy global auth.json if not yet present
-    auth_src = os.path.expanduser("~/.grok/auth.json")
-    auth_dst = os.path.join(grok_dir, "auth.json")
-    if not os.path.exists(auth_dst) and os.path.exists(auth_src):
-        try:
-            shutil.copy(auth_src, auth_dst)
-            os.chmod(auth_dst, 0o600)
-        except OSError as e:
-            logger.warning("Failed to copy auth.json for %s: %s", user_id, e)
+    _sync_grok_auth(grok_dir)
 
     return session_dir
 
@@ -258,18 +308,18 @@ def _parse_grok_output(stdout_text: str, session_dir: str) -> tuple:
     ({type: error, message: ...}). Falls back to plain text on parse failure.
     """
     if not stdout_text:
-        return "(empty response)", []
+        return EMPTY_REPLY, []
 
     try:
         data = json.loads(stdout_text)
     except json.JSONDecodeError:
         # Non-JSON output — treat as plain text
-        return clean_output(stdout_text) or "(empty response)", []
+        return clean_output(stdout_text) or EMPTY_REPLY, []
 
     if data.get("type") == "error":
         msg = data.get("message", "unknown grok error")
         logger.warning("grok error: %s", msg)
-        return f"❌ **{msg}** ❌", []
+        return format_cli_error(msg, backend="grok"), []
 
     display = data.get("text", "")
     session_id = data.get("sessionId", "")
@@ -285,7 +335,7 @@ def _parse_grok_output(stdout_text: str, session_dir: str) -> tuple:
         display,
     )
 
-    return clean_output(display) or "(empty response)", artifacts
+    return clean_output(display) or EMPTY_REPLY, artifacts
 
 
 # ---------------------------------------------------------------------------
@@ -346,32 +396,41 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
 
         display, artifacts = _parse_grok_output(stdout_text, session_dir)
 
-        if process.returncode != 0 and not display:
+        # Failure detection: non-zero exit, or structured error already formatted
+        failed = process.returncode != 0 or (
+            isinstance(display, str) and display.startswith("❌")
+        )
+        if process.returncode != 0 and (not display or display == EMPTY_REPLY):
             logger.warning(
                 "grok exited with code %s for user %s: %.200s",
                 process.returncode, user_id, stderr_text,
             )
-            return clean_output(stderr_text) or "❌ **grok 执行失败** ❌", []
+            display = format_cli_error(
+                stderr_text or "grok 进程异常退出", backend="grok"
+            )
+            artifacts = []
+            failed = True
 
-        if first:
+        # Only mark session initialized on a real successful reply
+        if first and not failed:
             mark_initialized(session_dir)
 
         elapsed = time.time() - t0
         logger.info(
-            "grok done: user=%s elapsed=%.1fs artifacts=%d output=%d chars",
-            user_id, elapsed, len(artifacts), len(display),
+            "grok done: user=%s elapsed=%.1fs artifacts=%d output=%d chars failed=%s",
+            user_id, elapsed, len(artifacts), len(display), failed,
         )
         return display, artifacts
 
     except asyncio.TimeoutError:
         logger.warning("grok execution timed out after %ss for user %s", timeout, user_id)
         await terminate_process(process, graceful=True)
-        return "⏰ **处理超时** ⏰", []
+        return format_error("处理超时", f"超过 {timeout} 秒未完成，已终止本次任务。"), []
 
     except Exception as e:
         logger.exception("Unexpected error running grok: %s", e)
         await terminate_process(process, graceful=False)
-        return f"❌ **执行出错** ❌\n\n```\n{str(e)}\n```", []
+        return format_error("执行出错", str(e)), []
 
 
 async def _run_grok_subcommand(subcmd_args: list, user_id: str) -> str:
@@ -400,15 +459,23 @@ async def _run_grok_subcommand(subcmd_args: list, user_id: str) -> str:
 
         if process.returncode != 0:
             logger.warning("grok %s exited with code %s", " ".join(subcmd_args), process.returncode)
-            return clean_output(stderr_text) if stderr_text else "❌ **终端指令执行失败** ❌"
+            # Prefer stdout (often JSON error) then stderr
+            raw = stdout_text or stderr_text or "终端指令执行失败"
+            try:
+                data = json.loads(stdout_text) if stdout_text else None
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict) and data.get("type") == "error":
+                return format_cli_error(data.get("message") or raw, backend="grok")
+            return format_cli_error(raw, backend="grok")
 
-        return clean_output(stdout_text) or "(empty response)"
+        return clean_output(stdout_text) or EMPTY_REPLY
 
     except asyncio.TimeoutError:
-        return "❌ **指令超时** ❌"
+        return format_error("指令超时", "子命令 30 秒内未完成。")
     except Exception as e:
         logger.exception("Subcommand error: %s", e)
-        return f"❌ **执行出错** ❌\n\n```\n{str(e)}\n```"
+        return format_error("执行出错", str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -450,24 +517,22 @@ async def _cmd_model(args: str, user_id: str) -> str:
 
     # Exact match
     if name in models:
-        prefs = load_prefs(user_id)
-        prefs["model"] = name
         _, embedded = parse_model_effort(name)
         if embedded:
-            prefs.pop("effort", None)
-        save_prefs(user_id, prefs)
+            update_active_prefs(user_id, model=name, effort="")
+        else:
+            update_active_prefs(user_id, model=name)
         return f"✅ **模型已切换** ✅\n\n`{name}`"
 
     # Prefix match
     prefix_matches = [m for m in models if m.startswith(name)]
     if prefix_matches:
         matched = prefix_matches[0]
-        prefs = load_prefs(user_id)
-        prefs["model"] = matched
         _, embedded = parse_model_effort(matched)
         if embedded:
-            prefs.pop("effort", None)
-        save_prefs(user_id, prefs)
+            update_active_prefs(user_id, model=matched, effort="")
+        else:
+            update_active_prefs(user_id, model=matched)
         return f"✅ **模型已切换** ✅\n\n`{matched}`"
 
     return f"❌ **模型不存在** ❌\n\n`{name}`"
@@ -544,15 +609,11 @@ async def handle_grok_slash_command(text: str, user_id: str) -> str | None:
             return "❌ **重置失败** ❌"
 
     if cmd == "/fast":
-        prefs = load_prefs(user_id)
-        prefs["effort"] = "low"
-        save_prefs(user_id, prefs)
+        update_active_prefs(user_id, effort="low")
         return "✅ **已开启 fast 模式** ✅"
 
     if cmd == "/planning":
-        prefs = load_prefs(user_id)
-        prefs["mode"] = "plan"
-        save_prefs(user_id, prefs)
+        update_active_prefs(user_id, mode="plan")
         return "✅ **已开启 planning 模式** ✅"
 
     if cmd == "/model":

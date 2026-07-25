@@ -5,14 +5,21 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-07-25
+
+### Fixed
+
+- **Backend switch kept the old model**: switching `/backend` only changed the backend flag; the previous backend's model (e.g. gemini) was still passed to the new CLI and failed on first message. Preferences now remember **model / effort / mode per backend**; first visit uses empty (CLI default), later visits restore the user's last choice.
+- **Grok false "Not signed in"**: per-session `auth.json` was a one-shot copy of host credentials and went stale or missing while host login remained valid. Session auth now **symlinks** to host `~/.grok/auth.json` (copy fallback).
+- **Error reply style**: CLI English errors were stuffed into `❌ **...** ❌` titles. Replies now use a fixed Chinese header line plus body; known cases (login, rate limit, network, timeout, bad model, etc.) get Chinese titles.
+- Failed Grok/agy runs no longer mark the session as initialized (avoids `--continue` on a broken first turn).
+- agy non-zero exits with English stdout are formatted as errors instead of sent as normal replies.
+
 ### Changed
 
-- Made all default paths cross-platform using `~`-relative locations (`session_base_dir`, `agy_scratch_dir`), replacing hardcoded `/var/lib/...` and `/root/...` paths.
-- Added `USERPROFILE` environment variable for agy subprocess on Windows (alongside `HOME` for Unix).
-- Guarded `os.getpgid` / `os.killpg` / `signal.SIGKILL` calls with `hasattr` checks; Windows falls back to `process.kill()` for timeout and error cleanup.
-- Removed stale root-level duplicate scripts (`agy_runner.py`, `config.py`, `ilink.py`, `main.py`) that were out of sync with the `wechatbridge/` subpackage.
-- Bumped version to 1.1.0; synced `__init__.py` and `pyproject.toml` version numbers.
-- Updated systemd service template to use `python -m wechatbridge` entry point with optional `EnvironmentFile` support.
+- Shared helpers in `runner_common.py`: `by_backend` prefs, `switch_backend_prefs` / `update_active_prefs`, `format_error` / `format_cli_error`, `EMPTY_REPLY`.
+- `/backend` status and switch replies show the active model label.
+- Version bumped to 1.2.1.
 
 ## [1.2.0] - 2026-07-25
 

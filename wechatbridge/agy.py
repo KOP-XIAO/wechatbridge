@@ -16,7 +16,8 @@ from .config import config
 from .runner_common import (
     sanitize_user_id, get_session_dir, is_first_message, mark_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
-    sanitize_env, terminate_process,
+    sanitize_env, terminate_process, update_active_prefs,
+    format_error, format_cli_error, EMPTY_REPLY,
     ANSI_RE, HTML_TAG_RE,
 )
 
@@ -190,7 +191,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         #   extract_artifacts (A) above is sufficient.
 
         # Clean display text
-        display = clean_output(stdout_text) or "(empty response)"
+        display = clean_output(stdout_text) or EMPTY_REPLY
 
         # Strip file:/// links from display to avoid leaking server paths
         display = re.sub(
@@ -223,16 +224,25 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                     )
                     r_stdout_text = r_stdout.decode("utf-8", errors="replace").strip()
                     r_stderr_text = r_stderr.decode("utf-8", errors="replace").strip()
-                    if retry_process.returncode == 0 or r_stdout_text:
+                    # Any useful stdout after retry counts as recovered (agy may exit non-zero)
+                    if r_stdout_text:
                         r_artifacts = extract_artifacts(r_stdout_text)
-                        r_display = clean_output(r_stdout_text) or "(empty response)"
+                        r_display = clean_output(r_stdout_text) or EMPTY_REPLY
                         r_display = re.sub(r"\[([^\]]+)\]\(file:///[^)]+\)", r"[\1]", r_display)
+                        if first and r_display != EMPTY_REPLY and not r_display.startswith("❌"):
+                            mark_initialized(session_dir)
                         return r_display, r_artifacts
-                    return "⚠️ **AI 模型 API 级联推理超时**，自动重试失败。请稍后重试或简化指令。", []
-                return clean_output(stderr_text), []
+                    return format_error(
+                        "级联超时",
+                        "模型 API 级联推理超时，自动重试仍失败。请稍后重试或简化指令。",
+                    ), []
+                return format_cli_error(stderr_text, backend="agy"), []
+            # Non-zero exit: never treat raw stdout as a normal success reply
+            raw = stderr_text or stdout_text or display or "agy 进程异常退出"
+            return format_cli_error(raw, backend="agy"), []
 
-
-        if first:
+        # Success path only
+        if first and display != EMPTY_REPLY:
             mark_initialized(session_dir)
 
         elapsed = time.time() - t0
@@ -249,12 +259,12 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
             user_id,
         )
         await terminate_process(process, graceful=True)
-        return "⏰ **处理超时** ⏰", []
+        return format_error("处理超时", f"超过 {timeout} 秒未完成，已终止本次任务。"), []
 
     except Exception as e:
         logger.exception("Unexpected error running agy: %s", e)
         await terminate_process(process, graceful=False)
-        return f"❌ **执行出错** ❌\n\n```\n{str(e)}\n```", []
+        return format_error("执行出错", str(e)), []
 
 
 # ---------------------------------------------------------------------------
@@ -292,17 +302,18 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
                 " ".join(subcmd_args),
                 process.returncode,
             )
-            return clean_output(stderr_text) if stderr_text else (
-                f"❌ **终端指令执行失败** ❌"
+            return format_cli_error(
+                stderr_text or stdout_text or "终端指令执行失败",
+                backend="agy",
             )
 
-        return clean_output(stdout_text) or "(empty response)"
+        return clean_output(stdout_text) or EMPTY_REPLY
 
     except asyncio.TimeoutError:
-        return "❌ **指令超时** ❌"
+        return format_error("指令超时", "子命令 30 秒内未完成。")
     except Exception as e:
         logger.exception("Subcommand error: %s", e)
-        return f"❌ **执行出错** ❌\n\n```\n{str(e)}\n```"
+        return format_error("执行出错", str(e))
 
 
 def _cmd_help() -> str:
@@ -435,18 +446,14 @@ def _cmd_clear(user_id: str) -> str:
 
 
 def _cmd_fast(user_id: str) -> str:
-    """Handle /fast: set effort=low."""
-    prefs = load_prefs(user_id)
-    prefs["effort"] = "low"
-    save_prefs(user_id, prefs)
+    """Handle /fast: set effort=low (scoped to current backend)."""
+    update_active_prefs(user_id, effort="low")
     return "✅ **已开启 fast 模式** ✅"
 
 
 def _cmd_planning(user_id: str) -> str:
-    """Handle /planning: set mode=plan."""
-    prefs = load_prefs(user_id)
-    prefs["mode"] = "plan"
-    save_prefs(user_id, prefs)
+    """Handle /planning: set mode=plan (scoped to current backend)."""
+    update_active_prefs(user_id, mode="plan")
     return "✅ **已开启 planning 模式** ✅"
 
 
@@ -483,27 +490,24 @@ async def _cmd_model(args: str, user_id: str) -> str:
 
     # Exact match
     if name in models:
-        prefs = load_prefs(user_id)
-        prefs["model"] = name
-        # If model name carries an effort suffix, clear any stored effort
-        # so run_agy doesn't pass conflicting --effort flag
+        # If model name carries an effort suffix, clear stored effort so
+        # run_agy doesn't pass a conflicting --effort flag
         _, embedded = parse_model_effort(name)
         if embedded:
-            prefs.pop("effort", None)
-        save_prefs(user_id, prefs)
+            update_active_prefs(user_id, model=name, effort="")
+        else:
+            update_active_prefs(user_id, model=name)
         return f"✅ **模型已切换** ✅\n\n`{name}`"
 
     # Prefix match
     prefix_matches = [m for m in models if m.startswith(name)]
     if prefix_matches:
         matched = prefix_matches[0]
-        prefs = load_prefs(user_id)
-        prefs["model"] = matched
-        # If model name carries an effort suffix, clear any stored effort
         _, embedded = parse_model_effort(matched)
         if embedded:
-            prefs.pop("effort", None)
-        save_prefs(user_id, prefs)
+            update_active_prefs(user_id, model=matched, effort="")
+        else:
+            update_active_prefs(user_id, model=matched)
         return f"✅ **模型已切换** ✅\n\n`{matched}`"
 
     return f"❌ **模型不存在** ❌\n\n`{name}`"
