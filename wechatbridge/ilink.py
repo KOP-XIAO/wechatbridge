@@ -15,7 +15,7 @@ import random
 import time
 import uuid
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -24,6 +24,32 @@ from .config import config
 logger = logging.getLogger("ilink")
 
 ILINK_BASE = config.ilink_base_url.rstrip("/")
+
+
+def _is_allowed_media_url(url: str) -> bool:
+    """Only allow downloads from WeChat CDN hosts or the configured CDN base host."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    if host == "weixin.qq.com" or host.endswith(".weixin.qq.com"):
+        return True
+    if host == "qq.com" or host.endswith(".qq.com"):
+        # WeChat CDN commonly uses *.cdn.weixin.qq.com / *.qq.com
+        if "weixin" in host or "cdn" in host or "novac" in host:
+            return True
+    try:
+        base_host = (urlparse(config.cdn_base_url).hostname or "").lower()
+    except Exception:
+        base_host = ""
+    if base_host and host == base_host:
+        return True
+    return False
 
 # iLink app identity (mirrors official @tencent-weixin/openclaw-weixin package.json)
 ILINK_APP_ID = "bot"
@@ -174,6 +200,13 @@ class ILinkState:
             self.baseurl,
         )
         try:
+            parent = os.path.dirname(os.path.abspath(self.path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+                try:
+                    os.chmod(parent, 0o700)
+                except OSError:
+                    pass
             with open(self.path, "w") as f:
                 json.dump(data, f)
             os.chmod(self.path, 0o600)
@@ -694,27 +727,40 @@ class ILinkClient:
         baseurl: str,
         bot_token: str,
     ) -> bool:
-        """Send a text message reply via iLink with automatic retries."""
+        """Send a text message reply via iLink with automatic retries.
+
+        Long texts are split into chunks (config.message_chunk_chars) so WeChat
+        length limits do not silently drop the whole reply.
+        """
+        from .runner_common import split_message_chunks
+
+        chunks = split_message_chunks(text, config.message_chunk_chars)
         url = f"{baseurl}/ilink/bot/sendmessage"
         headers = _common_headers(has_auth=True, bot_token=bot_token)
-        client_id = f"wechatbridge-{uuid.uuid4().hex[:16]}"
-        body = {
-            "msg": {
-                "from_user_id": "",
-                "to_user_id": to_user_id,
-                "client_id": client_id,
-                "message_type": 2,
-                "message_state": 2,
-                "context_token": context_token,
-                "item_list": [
-                    {"type": 1, "text_item": {"text": text}}
-                ],
-            },
-            "base_info": _build_base_info(),
-        }
-        return await self._post_sendmessage_with_retry(
-            url=url, headers=headers, body=body, to_user_id=to_user_id, log_label="send_message"
-        )
+        all_ok = True
+        for idx, chunk in enumerate(chunks):
+            client_id = f"wechatbridge-{uuid.uuid4().hex[:16]}"
+            body = {
+                "msg": {
+                    "from_user_id": "",
+                    "to_user_id": to_user_id,
+                    "client_id": client_id,
+                    "message_type": 2,
+                    "message_state": 2,
+                    "context_token": context_token,
+                    "item_list": [
+                        {"type": 1, "text_item": {"text": chunk}}
+                    ],
+                },
+                "base_info": _build_base_info(),
+            }
+            label = "send_message" if len(chunks) == 1 else f"send_message[{idx + 1}/{len(chunks)}]"
+            ok = await self._post_sendmessage_with_retry(
+                url=url, headers=headers, body=body, to_user_id=to_user_id, log_label=label
+            )
+            if not ok:
+                all_ok = False
+        return all_ok
 
 
     # ---- Image download and decryption ----
@@ -757,16 +803,47 @@ class ILinkClient:
         else:
             url = f"{config.cdn_base_url}/download?encrypted_query_param={quote(encrypt_query_param)}"
 
-        # Download encrypted bytes
+        if not _is_allowed_media_url(url):
+            raise ValueError(f"拒绝非微信 CDN 下载地址: {url[:120]}")
+
+        # Stream download; abort as soon as size exceeds cap (even without Content-Length)
+        max_in = max(int(config.max_inbound_file_bytes), 1)
         logger.info("Downloading encrypted media from CDN: %s", url[:80])
         t0 = time.time()
-        resp = await self.http_client.get(url, timeout=30.0)
-        resp.raise_for_status()
-        encrypted = resp.content
+        buf = bytearray()
+        async with self.http_client.stream("GET", url, timeout=30.0) as resp:
+            resp.raise_for_status()
+            cl = resp.headers.get("content-length")
+            if cl is not None:
+                try:
+                    if int(cl) > max_in:
+                        raise ValueError(
+                            f"入站文件过大（Content-Length {cl} > {max_in} 字节）"
+                        )
+                except ValueError as e:
+                    if "入站文件过大" in str(e):
+                        raise
+            async for piece in resp.aiter_bytes():
+                if not piece:
+                    continue
+                if len(buf) + len(piece) > max_in:
+                    raise ValueError(
+                        f"入站文件过大（>{max_in} 字节，已中止下载）"
+                    )
+                buf.extend(piece)
+        encrypted = bytes(buf)
+        if len(encrypted) > max_in:
+            raise ValueError(
+                f"入站文件过大（{len(encrypted)} > {max_in} 字节）"
+            )
         elapsed = time.time() - t0
         logger.debug("CDN download: %d bytes in %.3fs", len(encrypted), elapsed)
 
         # AES-128-ECB decrypt
         plaintext = _decrypt_aes_ecb(encrypted, key)
+        if len(plaintext) > max_in:
+            raise ValueError(
+                f"入站解密后文件过大（{len(plaintext)} > {max_in} 字节）"
+            )
         logger.info("Media decrypted: %d bytes -> %d bytes", len(encrypted), len(plaintext))
         return plaintext

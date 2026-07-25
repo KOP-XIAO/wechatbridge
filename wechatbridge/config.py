@@ -103,8 +103,8 @@ class AppConfig:
         os.path.join(_instance_data_dir, ".current_qrcode_url.txt"),
     )
 
-    # Timeout for CLI execution (seconds) — default 3600s (60 minutes / 1 hour)
-    agy_timeout: int = _env_int("AGY_TIMEOUT", 3600)
+    # Timeout for CLI execution (seconds) — default 600s; override via AGY_TIMEOUT
+    agy_timeout: int = _env_int("AGY_TIMEOUT", 600)
 
     # QR code polling timeout (seconds)
     qrcode_poll_timeout: int = _env_int("QRCODE_POLL_TIMEOUT", 180)
@@ -121,11 +121,41 @@ class AppConfig:
     # agy scratch directory (where agy writes generated files)
     agy_scratch_dir: str = os.getenv("AGY_SCRATCH_DIR", os.path.expanduser("~/.gemini/antigravity-cli/scratch"))
 
-    # Scratch file retention days (TTL cleanup)
+    # Global agy scratch retention days (TTL cleanup)
     scratch_retention_days: int = _env_int("AGY_SCRATCH_RETENTION_DAYS", 7)
+
+    # Per-session temp cleanup (media, .cache, scratch/logs) — not dialogue history.
+    # Defaults to the same value as scratch_retention_days.
+    session_retention_days: int = _env_int(
+        "WECHATBRIDGE_SESSION_RETENTION_DAYS",
+        _env_int("AGY_SCRATCH_RETENTION_DAYS", 7),
+    )
+
+    # Dialogue history idle TTL: conversations/brain/grok sessions untouched this
+    # many days are deleted. Active chats (files still updated) are kept.
+    history_retention_days: int = _env_int(
+        "WECHATBRIDGE_HISTORY_RETENTION_DAYS", 30
+    )
 
     # Maximum outbound file size (bytes) — 100 MB, Tencent OpenClaw SDK limit
     max_outbound_file_bytes: int = _env_int("WECHATBRIDGE_MAX_OUTBOUND_BYTES", 100 * 1024 * 1024)
+
+    # Maximum inbound image/file size after download (bytes) — default 20 MB
+    max_inbound_file_bytes: int = _env_int("WECHATBRIDGE_MAX_INBOUND_BYTES", 20 * 1024 * 1024)
+
+    # Max concurrent message handlers (global). Extra messages get a busy reply.
+    max_concurrent_tasks: int = _env_int("WECHATBRIDGE_MAX_CONCURRENT", 4)
+
+    # WeChat text chunk size (characters) when splitting long replies
+    message_chunk_chars: int = _env_int("WECHATBRIDGE_MESSAGE_CHUNK", 2000)
+
+    # Extra roots allowed for /add-dir (comma-separated absolute paths).
+    # Session dir is always allowed. Empty = only session dir (and its children).
+    add_dir_roots: list = [
+        os.path.expanduser(s.strip())
+        for s in os.getenv("WECHATBRIDGE_ADD_DIR_ROOTS", "").split(",")
+        if s.strip()
+    ]
 
     # CDN upload timeout (seconds)
     cdn_upload_timeout: int = _env_int("CDN_UPLOAD_TIMEOUT", 120)
@@ -156,3 +186,22 @@ class AppConfig:
 
 
 config = AppConfig()
+
+
+def ensure_runtime_dirs() -> None:
+    """Create instance data / session / state / qrcode parent dirs with tight perms."""
+    paths = {
+        _instance_data_dir,
+        config.session_base_dir,
+        os.path.dirname(os.path.abspath(config.state_file_path)) or ".",
+        os.path.dirname(os.path.abspath(config.qrcode_png_path)) or ".",
+        os.path.dirname(os.path.abspath(config.qrcode_url_path)) or ".",
+    }
+    for path in paths:
+        if not path or path == ".":
+            continue
+        try:
+            os.makedirs(path, exist_ok=True)
+            os.chmod(path, 0o700)
+        except OSError as e:
+            logger.warning("Failed to ensure runtime dir %s: %s", path, e)

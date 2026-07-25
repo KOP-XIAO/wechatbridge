@@ -14,11 +14,11 @@ import time
 
 from .config import config
 from .runner_common import (
-    sanitize_user_id, get_session_dir, is_first_message, mark_initialized,
+    sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
     format_error, format_cli_error, EMPTY_REPLY,
-    ANSI_RE, HTML_TAG_RE,
+    ANSI_RE, HTML_TAG_RE, validate_add_dir,
 )
 
 logger = logging.getLogger("agy_runner")
@@ -53,10 +53,15 @@ def ensure_user_gemini(user_id: str) -> str:
     Copies global auth token and default GEMINI.md (persona) on first use.
     Returns session_dir path (for use as HOME when running agy).
     """
-    session_dir = get_session_dir(user_id)
+    session_dir = ensure_session_dir(user_id)
     gemini_dir = os.path.join(session_dir, ".gemini")
     antigravity_dir = os.path.join(gemini_dir, "antigravity-cli")
     os.makedirs(antigravity_dir, exist_ok=True)
+    try:
+        os.chmod(gemini_dir, 0o700)
+        os.chmod(antigravity_dir, 0o700)
+    except OSError:
+        pass
 
     # Copy global auth token if not yet present
     # agy standard auth token path, managed by agy CLI
@@ -141,8 +146,13 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
     if prefs.get("mode"):
         cmd += ["--mode", prefs["mode"]]
     for d in prefs.get("add_dirs", []):
-        if d:
-            cmd += ["--add-dir", d]
+        if not d:
+            continue
+        ok, resolved = validate_add_dir(d, user_id)
+        if ok:
+            cmd += ["--add-dir", resolved]
+        else:
+            logger.warning("Skipping disallowed add_dir for %s: %s (%s)", user_id, d, resolved)
 
     if first:
         logger.info(
@@ -458,17 +468,21 @@ def _cmd_planning(user_id: str) -> str:
 
 
 def _cmd_add_dir(args: str, user_id: str) -> str:
-    """Handle /add-dir <path>: add path to add_dirs list (dedup)."""
+    """Handle /add-dir <path>: add path to add_dirs list (dedup, validated)."""
     path = args.strip()
     if not path:
         return "❌ **缺少参数** ❌\n\n`/add-dir <路径>`"
+    ok, result = validate_add_dir(path, user_id)
+    if not ok:
+        return f"❌ **目录不允许** ❌\n\n{result}"
+    resolved = result
     prefs = load_prefs(user_id)
     dirs = prefs.get("add_dirs", [])
-    if path not in dirs:
-        dirs.append(path)
+    if resolved not in dirs:
+        dirs.append(resolved)
         prefs["add_dirs"] = dirs
         save_prefs(user_id, prefs)
-    return f"✅ **已添加工作目录** ✅\n\n```\n{path}\n```"
+    return f"✅ **已添加工作目录** ✅\n\n```\n{resolved}\n```"
 
 
 async def _cmd_model(args: str, user_id: str) -> str:

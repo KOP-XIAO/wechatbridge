@@ -5,6 +5,28 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-07-25
+
+### Security / Hardening
+
+- Child env sanitization now strips `*_API_KEY` / token-style names (not only vars whose names *start with* KEY/TOKEN).
+- `/add-dir` validates path exists and stays under session dir or `WECHATBRIDGE_ADD_DIR_ROOTS`.
+- Artifact send uses `realpath` so symlinks cannot escape the allowed root.
+- Inbound media size cap (`WECHATBRIDGE_MAX_INBOUND_BYTES`, default 20MB); CDN download URL host allowlist.
+- Inbound CDN download is **streamed** and aborts as soon as the size cap is exceeded (no full-body buffer when Content-Length is missing).
+- Global concurrency limit (`WECHATBRIDGE_MAX_CONCURRENT`, default 4) with busy reply when full.
+- Session dirs and runtime data dirs created as `0700`; QR/state files `0600`.
+
+### Fixed
+
+- State/QR parent directories are created automatically (avoids silent save failures on new instance).
+- Images/files missing `aes_key` now reply with a clear error instead of silent drop.
+- Long WeChat replies are split into chunks (`WECHATBRIDGE_MESSAGE_CHUNK`); split is lossless (`''.join(chunks) == original`).
+- Session cleanup: temps (media/`.cache`/scratch) use `WECHATBRIDGE_SESSION_RETENTION_DAYS` (default = scratch TTL); **dialogue history** uses separate idle TTL `WECHATBRIDGE_HISTORY_RETENTION_DAYS` (default **30** days). History is expired as **units** (SQLite `*.db`+wal/shm together; brain/session trees by newest mtime) so partial deletes cannot corrupt an active DB. Prefs/auth kept; clears `.initialized` when no history remains. Idle user locks pruned.
+- Default CLI timeout lowered to 600s (still overridable via `AGY_TIMEOUT`).
+- Dangerous-keyword defaults avoid bare Chinese words like「删除」; focus on concrete destructive patterns.
+- `deploy/wechatbridge.env.example` state/session path docs corrected.
+
 ## [1.2.1] - 2026-07-25
 
 ### Fixed

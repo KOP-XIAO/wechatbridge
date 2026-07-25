@@ -13,14 +13,16 @@ import time
 import uuid
 from io import StringIO
 
-from .config import config
+from .config import config, ensure_runtime_dirs
 from .ilink import ILinkClient
 from .runner_common import (
+    clean_session_media,
     format_error,
     format_model_label,
     get_session_dir,
     is_dangerous,
     load_prefs,
+    path_is_under,
     save_prefs,
     switch_backend_prefs,
 )
@@ -156,17 +158,28 @@ async def login_flow(client: ILinkClient) -> bool:
             qr.add_data(qrcode_url)
             qr.make(fit=True)
             im = qr.make_image()
+            parent = os.path.dirname(os.path.abspath(config.qrcode_png_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             im.save(config.qrcode_png_path)
+            try:
+                os.chmod(config.qrcode_png_path, 0o600)
+            except OSError:
+                pass
             logger.info(
                 "二维码图片已保存到 %s", config.qrcode_png_path
             )
         except Exception as e:
             logger.warning("保存二维码 PNG 失败: %s", e)
 
-        # Write URL to file for external access
+        # Write URL to file for external access (restrict permissions)
         try:
+            parent = os.path.dirname(os.path.abspath(config.qrcode_url_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
             with open(config.qrcode_url_path, "w") as f:
                 f.write(qrcode_url)
+            os.chmod(config.qrcode_url_path, 0o600)
         except Exception as e:
             logger.warning("写入二维码 URL 文件失败: %s", e)
 
@@ -242,19 +255,20 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
     backend = _get_backend(from_user)
     if backend == "grok":
         # grok runs with cwd=session_dir, artifacts are under session_dir
-        scratch_prefix = os.path.abspath(session_dir) + os.sep
+        allowed_root = session_dir
     else:
         # agy writes to .gemini/antigravity-cli/scratch under session_dir
-        user_scratch = os.path.join(session_dir, '.gemini', 'antigravity-cli', 'scratch')
-        scratch_prefix = os.path.abspath(user_scratch) + os.sep
+        allowed_root = os.path.join(session_dir, ".gemini", "antigravity-cli", "scratch")
     for art_name, art_path in artifacts:
         try:
-            if not os.path.abspath(art_path).startswith(scratch_prefix):
+            # realpath check blocks symlink escape outside allowed root
+            if not path_is_under(art_path, allowed_root):
                 logger.debug("skip non-scratch artifact: %s", art_path)
                 continue
-            if not os.path.isfile(art_path):
+            if not os.path.isfile(os.path.realpath(art_path)):
                 logger.warning("Artifact not found: %s", art_path)
                 continue
+            art_path = os.path.realpath(art_path)
             file_size = os.path.getsize(art_path)
             if file_size > config.max_outbound_file_bytes:
                 size_mb = file_size / (1024 * 1024)
@@ -394,67 +408,83 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
     # ---- Case 1: Message contains an image ----
     artifacts = []
     reply = ""
-    if image_media and image_media.get("aes_key"):
-        try:
-            # Download CDN image and AES decrypt → plaintext bytes
-            plain_bytes = await client.download_and_decrypt_media(image_media)
+    if image_media:
+        if not image_media.get("aes_key"):
+            reply = format_error("图片无法处理", "缺少解密密钥，请重新发送图片。")
+            logger.warning("图片缺少 aes_key from=%s", from_user)
+        else:
+            try:
+                # Download CDN image and AES decrypt → plaintext bytes
+                plain_bytes = await client.download_and_decrypt_media(image_media)
 
-            # Detect extension from magic bytes
-            ext = _detect_image_ext(plain_bytes)
+                # Detect extension from magic bytes
+                ext = _detect_image_ext(plain_bytes)
 
-            # Save to per-user session images directory
-            images_dir = os.path.join(get_session_dir(from_user), "images")
-            os.makedirs(images_dir, exist_ok=True)
-            save_path = os.path.join(images_dir, f"{uuid.uuid4().hex[:12]}.{ext}")
-            with open(save_path, "wb") as f:
-                f.write(plain_bytes)
+                # Save to per-user session images directory
+                images_dir = os.path.join(get_session_dir(from_user), "images")
+                os.makedirs(images_dir, exist_ok=True)
+                try:
+                    os.chmod(images_dir, 0o700)
+                except OSError:
+                    pass
+                save_path = os.path.join(images_dir, f"{uuid.uuid4().hex[:12]}.{ext}")
+                with open(save_path, "wb") as f:
+                    f.write(plain_bytes)
 
-            logger.info(
-                "图片已保存 %s (%d bytes, ext=%s)",
-                save_path, len(plain_bytes), ext,
-            )
+                logger.info(
+                    "图片已保存 %s (%d bytes, ext=%s)",
+                    save_path, len(plain_bytes), ext,
+                )
 
-            # Build prompt: user's caption if present, else default
-            prompt = text.strip() if text.strip() else "请描述这张图片的内容"
-            logger.info("识图 from=%s: %s @%s", from_user, prompt, save_path)
-            result = await gate_and_run(client, from_user, context_token, f"{prompt} @{save_path}")
-            if result is None:
-                return
-            reply, artifacts = result
+                # Build prompt: user's caption if present, else default
+                prompt = text.strip() if text.strip() else "请描述这张图片的内容"
+                logger.info("识图 from=%s: %s @%s", from_user, prompt, save_path)
+                result = await gate_and_run(client, from_user, context_token, f"{prompt} @{save_path}")
+                if result is None:
+                    return
+                reply, artifacts = result
 
-        except Exception as e:
-            logger.exception("图片下载/解密失败: %s", e)
-            reply = format_error("图片下载或解密失败", str(e))
+            except Exception as e:
+                logger.exception("图片下载/解密失败: %s", e)
+                reply = format_error("图片下载或解密失败", str(e))
 
     # ---- Case 1.5: Message contains a file (non-image) ----
-    elif file_media and file_media.get("aes_key"):
-        try:
-            plain_bytes = await client.download_and_decrypt_media(file_media)
+    elif file_media:
+        if not file_media.get("aes_key"):
+            reply = format_error("文件无法处理", "缺少解密密钥，请重新发送文件。")
+            logger.warning("文件缺少 aes_key from=%s", from_user)
+        else:
+            try:
+                plain_bytes = await client.download_and_decrypt_media(file_media)
 
-            # Save to per-user session files directory
-            files_dir = os.path.join(get_session_dir(from_user), "files")
-            os.makedirs(files_dir, exist_ok=True)
-            # Preserve original extension from file_name
-            ext = os.path.splitext(file_name)[1] if file_name else ""
-            save_name = f"{uuid.uuid4().hex[:12]}{ext}" if ext else (file_name or uuid.uuid4().hex[:12])
-            save_path = os.path.join(files_dir, save_name)
-            with open(save_path, "wb") as f:
-                f.write(plain_bytes)
+                # Save to per-user session files directory
+                files_dir = os.path.join(get_session_dir(from_user), "files")
+                os.makedirs(files_dir, exist_ok=True)
+                try:
+                    os.chmod(files_dir, 0o700)
+                except OSError:
+                    pass
+                # Preserve original extension from file_name (basename only)
+                ext = os.path.splitext(os.path.basename(file_name or ""))[1]
+                save_name = f"{uuid.uuid4().hex[:12]}{ext}" if ext else uuid.uuid4().hex[:12]
+                save_path = os.path.join(files_dir, save_name)
+                with open(save_path, "wb") as f:
+                    f.write(plain_bytes)
 
-            logger.info(
-                "文件已保存 %s (%d bytes)", save_path, len(plain_bytes),
-            )
+                logger.info(
+                    "文件已保存 %s (%d bytes)", save_path, len(plain_bytes),
+                )
 
-            prompt = text.strip() if text.strip() else "请分析这个文件"
-            logger.info("文件分析 from=%s: %s @%s", from_user, prompt, save_path)
-            result = await gate_and_run(client, from_user, context_token, f"{prompt} @{save_path}")
-            if result is None:
-                return
-            reply, artifacts = result
+                prompt = text.strip() if text.strip() else "请分析这个文件"
+                logger.info("文件分析 from=%s: %s @%s", from_user, prompt, save_path)
+                result = await gate_and_run(client, from_user, context_token, f"{prompt} @{save_path}")
+                if result is None:
+                    return
+                reply, artifacts = result
 
-        except Exception as e:
-            logger.exception("文件下载/解密失败: %s", e)
-            reply = format_error("文件下载或解密失败", str(e))
+            except Exception as e:
+                logger.exception("文件下载/解密失败: %s", e)
+                reply = format_error("文件下载或解密失败", str(e))
 
     # ---- Case 1.6: Voice message (text transcription passthrough) ----
     elif has_voice:
@@ -516,22 +546,28 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def clean_scratch():
-    """Remove scratch files older than scratch_retention_days."""
+    """Remove old global scratch files and per-user session media."""
     scratch_dir = config.agy_scratch_dir
-    if not os.path.isdir(scratch_dir):
-        return
-    now = time.time()
-    cutoff = now - config.scratch_retention_days * 86400
-    try:
-        for name in os.listdir(scratch_dir):
-            path = os.path.join(scratch_dir, name)
-            if os.path.isfile(path):
-                mtime = os.path.getmtime(path)
-                if mtime < cutoff:
-                    os.remove(path)
-                    logger.info("Scratch cleanup: removed %s (age %.1f days)", path, (now - mtime) / 86400)
-    except OSError as e:
-        logger.error("Scratch cleanup error: %s", e)
+    if os.path.isdir(scratch_dir):
+        now = time.time()
+        cutoff = now - config.scratch_retention_days * 86400
+        try:
+            for name in os.listdir(scratch_dir):
+                path = os.path.join(scratch_dir, name)
+                if os.path.isfile(path):
+                    mtime = os.path.getmtime(path)
+                    if mtime < cutoff:
+                        os.remove(path)
+                        logger.info(
+                            "Scratch cleanup: removed %s (age %.1f days)",
+                            path, (now - mtime) / 86400,
+                        )
+        except OSError as e:
+            logger.error("Scratch cleanup error: %s", e)
+    removed = clean_session_media()  # images/files + safe session temps (A+C)
+    if removed:
+        logger.info("Session temp cleanup: removed %d files", removed)
+    _prune_user_locks()
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +585,7 @@ async def periodic_clean_scratch():
 
 async def main_loop() -> None:
     """Main daemon loop: manages state, QR login, and message receiving."""
+    ensure_runtime_dirs()
     clean_scratch()
     asyncio.create_task(periodic_clean_scratch())
     while True:
@@ -618,26 +655,65 @@ async def main_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Per-user async execution lock and background task spawner
+# Per-user async execution lock, global concurrency gate, background spawner
 # ---------------------------------------------------------------------------
 user_locks: dict = {}
+_global_task_sem: asyncio.Semaphore | None = None
+
+
+def _get_global_sem() -> asyncio.Semaphore:
+    global _global_task_sem
+    if _global_task_sem is None:
+        n = max(int(config.max_concurrent_tasks), 1)
+        _global_task_sem = asyncio.Semaphore(n)
+    return _global_task_sem
+
+
+def _prune_user_locks() -> None:
+    """Drop idle per-user locks so the dict does not grow forever."""
+    idle = [uid for uid, lock in user_locks.items() if not lock.locked()]
+    for uid in idle:
+        user_locks.pop(uid, None)
 
 
 async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
-    """Run process_message inside a per-user lock as a background task.
+    """Run process_message inside global concurrency + per-user locks.
 
     This ensures the main get_updates long-polling loop is NEVER blocked,
     keeping WeChat heartbeats 100% active while ensuring per-user message ordering.
     """
     from_user = msg.get("from_user_id", "")
-    if from_user not in user_locks:
-        user_locks[from_user] = asyncio.Lock()
+    context_token = msg.get("context_token", "")
+    sem = _get_global_sem()
 
-    async with user_locks[from_user]:
-        try:
-            await process_message(client, msg)
-        except Exception as e:
-            logger.exception("处理消息异常 (from=%s): %s", from_user, e)
+    # Fail fast when all slots are busy (do not queue unbounded work)
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=0.05)
+    except asyncio.TimeoutError:
+        logger.warning("并发已满，拒绝处理 from=%s", from_user)
+        if context_token and from_user:
+            try:
+                await client.send_message(
+                    to_user_id=from_user,
+                    text="⏳ **系统繁忙** ⏳\n\n当前处理人数已满，请稍后再试。",
+                    context_token=context_token,
+                    baseurl=client.state.baseurl,
+                    bot_token=client.state.bot_token,
+                )
+            except Exception as e:
+                logger.warning("发送繁忙提示失败: %s", e)
+        return
+
+    try:
+        if from_user not in user_locks:
+            user_locks[from_user] = asyncio.Lock()
+        async with user_locks[from_user]:
+            try:
+                await process_message(client, msg)
+            except Exception as e:
+                logger.exception("处理消息异常 (from=%s): %s", from_user, e)
+    finally:
+        sem.release()
 
 
 # ---------------------------------------------------------------------------

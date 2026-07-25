@@ -11,8 +11,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import sys
+import time
 
 from .config import config
 
@@ -27,6 +29,15 @@ HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SENSITIVE_PREFIXES = (
     "TOKEN", "KEY", "SECRET", "PASSWORD",
     "AWS", "GITHUB", "GITLAB", "CREDENTIAL",
+)
+# Segment names that mark a var as secret when they appear as a path part
+_SENSITIVE_SEGMENTS = frozenset({
+    "TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD",
+    "CREDENTIAL", "CREDENTIALS", "APIKEY", "API_KEY",
+})
+_SENSITIVE_SUFFIXES = (
+    "_TOKEN", "_KEY", "_SECRET", "_PASSWORD", "_PASSWD",
+    "_CREDENTIAL", "_CREDENTIALS", "_APIKEY",
 )
 
 
@@ -45,6 +56,65 @@ def get_session_dir(user_id: str) -> str:
     return os.path.join(config.session_base_dir, sanitize_user_id(user_id))
 
 
+def ensure_session_dir(user_id: str) -> str:
+    """Create per-user session dir with mode 0700 and return its path."""
+    path = get_session_dir(user_id)
+    try:
+        os.makedirs(path, exist_ok=True)
+        os.chmod(path, 0o700)
+    except OSError as e:
+        logger.warning("Failed to ensure session dir %s: %s", path, e)
+    return path
+
+
+def path_is_under(path: str, root: str) -> bool:
+    """True if path is the same as root or a realpath child of root."""
+    try:
+        real = os.path.realpath(path)
+        root_real = os.path.realpath(root)
+    except OSError:
+        return False
+    if real == root_real:
+        return True
+    prefix = root_real if root_real.endswith(os.sep) else root_real + os.sep
+    return real.startswith(prefix)
+
+
+def validate_add_dir(path: str, user_id: str) -> tuple[bool, str]:
+    """Validate /add-dir path: must exist as dir and sit under allowed roots.
+
+    Session dir is always allowed; extra roots from config.add_dir_roots.
+    Returns (ok, message_or_resolved_path).
+    """
+    raw = (path or "").strip()
+    if not raw:
+        return False, "路径为空"
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        # Relative paths resolve against session dir
+        expanded = os.path.join(get_session_dir(user_id), expanded)
+    try:
+        resolved = os.path.realpath(expanded)
+    except OSError as e:
+        return False, f"无法解析路径: {e}"
+    if not os.path.isdir(resolved):
+        return False, "路径不存在或不是目录"
+
+    allowed_roots = [get_session_dir(user_id)]
+    for r in getattr(config, "add_dir_roots", []) or []:
+        if r:
+            allowed_roots.append(os.path.expanduser(r))
+
+    if not any(path_is_under(resolved, root) for root in allowed_roots):
+        return False, (
+            "路径不在允许范围内。"
+            "仅允许会话目录"
+            + (" 或 WECHATBRIDGE_ADD_DIR_ROOTS 内路径" if config.add_dir_roots else "")
+            + "。"
+        )
+    return True, resolved
+
+
 def is_first_message(session_dir: str) -> bool:
     """Check if this user has no existing conversation."""
     return not os.path.exists(os.path.join(session_dir, ".initialized"))
@@ -54,6 +124,10 @@ def mark_initialized(session_dir: str) -> None:
     """Create .initialized flag file after first message."""
     try:
         os.makedirs(session_dir, exist_ok=True)
+        try:
+            os.chmod(session_dir, 0o700)
+        except OSError:
+            pass
         with open(os.path.join(session_dir, ".initialized"), "w") as f:
             f.write("1")
     except OSError as e:
@@ -421,10 +495,17 @@ def save_prefs(user_id: str, prefs: dict) -> None:
 # ---------------------------------------------------------------------------
 
 # Confirm gate: hardcoded dangerous keyword fallbacks (used when config.confirm_keywords is empty)
-# 宁枉勿纵 — 自然语言危险意图词也触发确认，日常误触多一轮确认即可取消
+# Prefer concrete shell/destructive patterns; avoid bare Chinese words like「删除」that false-positive daily chat.
 _DANGEROUS_KEYWORDS = [
-    "rm -rf /", "curl |sh", "curl | bash", "wget -o- | sh",
-    "删掉", "删除", "清空", "卸载", "格式化",
+    "rm -rf /", "rm -rf/*", "rm -rf ~", "rm -rf~",
+    "curl |sh", "curl|sh", "curl | bash", "curl|bash",
+    "wget -o- | sh", "wget|sh", "wget|bash",
+    "mkfs.", "mkfs ", "dd if=", ":(){", "fork bomb",
+    "chmod -r 777 /", "chmod -r 777/",
+    "drop table", "drop database",
+    "format c:", "del /f /s",
+    "格式化磁盘", "格式化硬盘", "清空系统", "删掉所有", "删除全部",
+    "卸载系统",
 ]
 
 
@@ -432,12 +513,12 @@ def is_dangerous(prompt: str) -> bool:
     """Check if a prompt contains dangerous keywords.
 
     Uses config.confirm_keywords if non-empty, otherwise falls back to
-    the hardcoded _DANGEROUS_KEYWORDS list (matching existing audit behavior).
+    the hardcoded _DANGEROUS_KEYWORDS list.
     """
     keywords = config.confirm_keywords if config.confirm_keywords else _DANGEROUS_KEYWORDS
     lower = prompt.lower()
     for kw in keywords:
-        if kw in lower:
+        if kw.lower() in lower:
             return True
     return False
 
@@ -464,20 +545,427 @@ def parse_model_effort(model: str) -> tuple[str, str | None]:
 # Subprocess environment and process management
 # ---------------------------------------------------------------------------
 
+def _is_sensitive_env_name(name: str) -> bool:
+    """True if env var name looks like a secret (prefix, segment, or suffix)."""
+    u = (name or "").upper()
+    if not u:
+        return False
+    if u.startswith(_SENSITIVE_PREFIXES):
+        return True
+    if u.endswith(_SENSITIVE_SUFFIXES):
+        return True
+    if "API_KEY" in u or "ACCESS_KEY" in u or "SECRET_KEY" in u or "AUTH_TOKEN" in u:
+        return True
+    for part in re.split(r"[._-]+", u):
+        if part in _SENSITIVE_SEGMENTS:
+            return True
+    return False
+
+
 def sanitize_env(session_dir: str) -> dict:
     """Build a clean environment dict for CLI subprocesses.
 
-    Strips sensitive vars, sets HOME (and USERPROFILE on Windows) to session_dir
-    for per-user isolation.
+    Strips sensitive vars (including XAI_API_KEY / OPENAI_API_KEY style names),
+    sets HOME (and USERPROFILE on Windows) to session_dir for per-user isolation.
     """
     env = {
         k: v for k, v in os.environ.items()
-        if not k.upper().startswith(_SENSITIVE_PREFIXES)
+        if not _is_sensitive_env_name(k)
     }
     env["HOME"] = session_dir
     if sys.platform == "win32":
         env["USERPROFILE"] = session_dir
     return env
+
+
+# Temporary / cache roots under each user session (safe to expire file-by-file).
+_SESSION_TEMP_REL_DIRS = (
+    "images",
+    "files",
+    ".cache",
+    os.path.join(".gemini", "antigravity-cli", "scratch"),
+    os.path.join(".gemini", "antigravity-cli", "crashes"),
+    os.path.join(".gemini", "antigravity-cli", "log"),
+    os.path.join(".gemini", "antigravity-cli", "cache"),
+    os.path.join(".grok", "logs"),
+)
+
+# Dialogue history — cleaned as *units* (never split SQLite sidecars / session trees).
+_HISTORY_CONVERSATIONS_REL = os.path.join(
+    ".gemini", "antigravity-cli", "conversations"
+)
+_HISTORY_BRAIN_REL = os.path.join(".gemini", "antigravity-cli", "brain")
+_HISTORY_KNOWLEDGE_REL = os.path.join(".gemini", "antigravity-cli", "knowledge")
+_HISTORY_GROK_SESSIONS_REL = os.path.join(".grok", "sessions")
+
+_SESSION_HISTORY_REL_DIRS = (
+    _HISTORY_CONVERSATIONS_REL,
+    _HISTORY_BRAIN_REL,
+    _HISTORY_KNOWLEDGE_REL,
+    _HISTORY_GROK_SESSIONS_REL,
+)
+
+# SQLite sidecar suffixes that must share fate with the main ``*.db`` file.
+_SQLITE_SIDECAR_TAILS = ("-wal", "-shm", "-journal")
+
+
+def _remove_old_files_under(root: str, cutoff: float) -> int:
+    """Delete files under root older than cutoff; prune empty subdirs.
+
+    For independent temp files only (images/cache/scratch). Does not remove
+    ``root`` itself. Returns number of files removed.
+    """
+    if not os.path.isdir(root):
+        return 0
+    removed = 0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+            for fn in filenames:
+                path = os.path.join(dirpath, fn)
+                try:
+                    if not os.path.isfile(path) and not os.path.islink(path):
+                        continue
+                    if os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                        removed += 1
+                        logger.info("Session cleanup: removed %s", path)
+                except OSError as e:
+                    logger.warning("Session cleanup failed %s: %s", path, e)
+            if dirpath == root:
+                continue
+            try:
+                if not os.listdir(dirpath):
+                    os.rmdir(dirpath)
+            except OSError:
+                pass
+    except OSError as e:
+        logger.warning("Session cleanup walk failed %s: %s", root, e)
+    return removed
+
+
+def _file_mtime(path: str) -> float | None:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _tree_newest_mtime(root: str) -> float | None:
+    """Newest *file* mtime under root (directory mtimes are ignored).
+
+    Parent dirs get a fresh mtime on mkdir/unlink of children; using them would
+    keep idle trees forever or falsely mark them active. Empty trees fall back
+    to the directory mtime so empty shells can still be pruned.
+    """
+    if os.path.isfile(root) or os.path.islink(root):
+        return _file_mtime(root)
+    if not os.path.isdir(root):
+        return _file_mtime(root)
+    newest: float | None = None
+    try:
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                m = _file_mtime(os.path.join(dirpath, fn))
+                if m is not None and (newest is None or m > newest):
+                    newest = m
+    except OSError as e:
+        logger.warning("Session cleanup mtime walk failed %s: %s", root, e)
+    if newest is None:
+        return _file_mtime(root)
+    return newest
+
+
+def _paths_newest_mtime(paths: list[str]) -> float | None:
+    newest: float | None = None
+    for path in paths:
+        if os.path.isdir(path) and not os.path.islink(path):
+            m = _tree_newest_mtime(path)
+        else:
+            m = _file_mtime(path)
+        if m is not None and (newest is None or m > newest):
+            newest = m
+    return newest
+
+
+def _delete_path_unit(path: str) -> int:
+    """Remove a file or directory tree. Returns number of *files* removed (est.)."""
+    removed = 0
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            for dirpath, _, filenames in os.walk(path):
+                removed += len(filenames)
+            shutil.rmtree(path)
+            logger.info("Session cleanup: removed tree %s", path)
+        elif os.path.lexists(path):
+            os.remove(path)
+            removed = 1
+            logger.info("Session cleanup: removed %s", path)
+    except OSError as e:
+        logger.warning("Session cleanup failed %s: %s", path, e)
+    return removed
+
+
+def _remove_idle_unit(paths: list[str], cutoff: float) -> int:
+    """If the unit's newest mtime is older than cutoff, delete every path in it.
+
+    Re-checks mtime immediately before delete (narrows TOCTOU). Keeps the whole
+    unit if *any* member is still fresh — never splits SQLite sidecars.
+    """
+    paths = [p for p in paths if os.path.lexists(p)]
+    if not paths:
+        return 0
+    newest = _paths_newest_mtime(paths)
+    if newest is None or newest >= cutoff:
+        return 0
+    # Re-check right before mutating
+    newest2 = _paths_newest_mtime(paths)
+    if newest2 is None or newest2 >= cutoff:
+        return 0
+    removed = 0
+    for path in paths:
+        removed += _delete_path_unit(path)
+    return removed
+
+
+def _sqlite_unit_key(filename: str) -> str | None:
+    """Map ``id.db`` / ``id.db-wal`` / ``id.db-shm`` / ``id.db-journal`` → ``id.db``.
+
+    Returns None if the name is not a SQLite main DB or known sidecar.
+    """
+    if filename.endswith(".db"):
+        return filename
+    for tail in _SQLITE_SIDECAR_TAILS:
+        # e.g. foo.db-wal → foo.db
+        suf = ".db" + tail
+        if filename.endswith(suf):
+            return filename[: -len(tail)]
+    return None
+
+
+def _clean_conversation_dbs(conv_dir: str, cutoff: float) -> int:
+    """Expire idle agy conversation SQLite DBs as whole units (db+wal+shm)."""
+    if not os.path.isdir(conv_dir):
+        return 0
+    groups: dict[str, list[str]] = {}
+    loose: list[str] = []
+    try:
+        names = os.listdir(conv_dir)
+    except OSError as e:
+        logger.warning("Session cleanup list failed %s: %s", conv_dir, e)
+        return 0
+    for name in names:
+        path = os.path.join(conv_dir, name)
+        if os.path.isdir(path) and not os.path.islink(path):
+            # Unexpected subdir: treat as tree unit
+            loose.append(path)
+            continue
+        key = _sqlite_unit_key(name)
+        if key is not None:
+            groups.setdefault(key, []).append(path)
+        else:
+            loose.append(path)
+    removed = 0
+    for key, members in groups.items():
+        removed += _remove_idle_unit(members, cutoff)
+    for path in loose:
+        removed += _remove_idle_unit([path], cutoff)
+    return removed
+
+
+def _clean_child_units(parent: str, cutoff: float) -> int:
+    """Expire each direct child (file or directory tree) by its newest mtime."""
+    if not os.path.isdir(parent):
+        return 0
+    removed = 0
+    try:
+        names = os.listdir(parent)
+    except OSError as e:
+        logger.warning("Session cleanup list failed %s: %s", parent, e)
+        return 0
+    for name in names:
+        path = os.path.join(parent, name)
+        removed += _remove_idle_unit([path], cutoff)
+    return removed
+
+
+def _clean_grok_sessions(sessions_root: str, cutoff: float) -> int:
+    """Expire idle grok session trees: sessions/<cwd-key>/<session-id>/ as units.
+
+    Top-level index files (e.g. session_search.sqlite) are their own units.
+    Empty cwd-key dirs are pruned afterward.
+    """
+    if not os.path.isdir(sessions_root):
+        return 0
+    removed = 0
+    try:
+        names = os.listdir(sessions_root)
+    except OSError as e:
+        logger.warning("Session cleanup list failed %s: %s", sessions_root, e)
+        return 0
+    for name in names:
+        path = os.path.join(sessions_root, name)
+        if os.path.isfile(path) or os.path.islink(path):
+            removed += _remove_idle_unit([path], cutoff)
+            continue
+        if not os.path.isdir(path):
+            continue
+        # cwd-key bucket: expire each session-id child as a full tree
+        try:
+            children = os.listdir(path)
+        except OSError as e:
+            logger.warning("Session cleanup list failed %s: %s", path, e)
+            continue
+        for child in children:
+            child_path = os.path.join(path, child)
+            removed += _remove_idle_unit([child_path], cutoff)
+        try:
+            if not os.listdir(path):
+                os.rmdir(path)
+                logger.info("Session cleanup: removed empty dir %s", path)
+        except OSError:
+            pass
+    return removed
+
+
+def _clean_user_history(user_dir: str, cutoff: float) -> int:
+    """Unit-based dialogue history cleanup for one user session directory."""
+    removed = 0
+    removed += _clean_conversation_dbs(
+        os.path.join(user_dir, _HISTORY_CONVERSATIONS_REL), cutoff
+    )
+    removed += _clean_child_units(
+        os.path.join(user_dir, _HISTORY_BRAIN_REL), cutoff
+    )
+    removed += _clean_child_units(
+        os.path.join(user_dir, _HISTORY_KNOWLEDGE_REL), cutoff
+    )
+    removed += _clean_grok_sessions(
+        os.path.join(user_dir, _HISTORY_GROK_SESSIONS_REL), cutoff
+    )
+    return removed
+
+
+def _dir_has_any_file(root: str) -> bool:
+    if not os.path.isdir(root):
+        return False
+    try:
+        for dirpath, _, filenames in os.walk(root):
+            if filenames:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _clear_initialized_if_no_history(user_dir: str) -> bool:
+    """If no dialogue history left, drop .initialized so next turn starts fresh.
+
+    Avoids --continue against an empty/missing conversation after TTL cleanup.
+    """
+    for rel in _SESSION_HISTORY_REL_DIRS:
+        if _dir_has_any_file(os.path.join(user_dir, rel)):
+            return False
+    flag = os.path.join(user_dir, ".initialized")
+    if not os.path.exists(flag):
+        return False
+    try:
+        os.remove(flag)
+        logger.info(
+            "Session cleanup: cleared .initialized for %s (no history left)",
+            user_dir,
+        )
+        return True
+    except OSError as e:
+        logger.warning("Session cleanup: failed to clear .initialized %s: %s", flag, e)
+        return False
+
+
+def clean_session_data(
+    retention_days: int | None = None,
+    history_retention_days: int | None = None,
+) -> int:
+    """Remove old session artifacts under each user directory.
+
+    Two TTLs:
+      - Temps (default ``session_retention_days``, often 7d): file-level mtime
+        under images/files/.cache/scratch/logs/...
+      - Dialogue history (default ``history_retention_days``, 30d): **unit** idle
+        time = newest mtime in the unit. Units are:
+          * agy ``conversations``: each ``*.db`` + ``*.db-wal/shm/journal`` together
+          * agy ``brain`` / ``knowledge``: each top-level child tree/file
+          * grok ``sessions``: each ``<cwd>/<session-id>/`` tree; top-level indexes alone
+
+    Never splits a unit (prevents half-deleted SQLite DBs). Does **not** touch
+    prefs, auth links, or CLI install trees.
+
+    If a user's history dirs are fully empty after cleanup, removes
+    ``.initialized`` so the next message starts a new conversation.
+
+    Returns number of removed files (trees count as their file totals).
+    """
+    if retention_days is None:
+        retention_days = config.session_retention_days
+    if history_retention_days is None:
+        history_retention_days = config.history_retention_days
+    base = config.session_base_dir
+    if not os.path.isdir(base):
+        return 0
+    now = time.time()
+    temp_cutoff = now - max(int(retention_days), 0) * 86400
+    hist_cutoff = now - max(int(history_retention_days), 0) * 86400
+    removed = 0
+    try:
+        for name in os.listdir(base):
+            user_dir = os.path.join(base, name)
+            if not os.path.isdir(user_dir):
+                continue
+            for rel in _SESSION_TEMP_REL_DIRS:
+                removed += _remove_old_files_under(
+                    os.path.join(user_dir, rel), temp_cutoff
+                )
+            removed += _clean_user_history(user_dir, hist_cutoff)
+            _clear_initialized_if_no_history(user_dir)
+    except OSError as e:
+        logger.error("Session data cleanup error: %s", e)
+    return removed
+
+
+def clean_session_media(retention_days: int | None = None) -> int:
+    """Backward-compatible alias for :func:`clean_session_data` (temps + history)."""
+    return clean_session_data(retention_days=retention_days)
+
+
+def split_message_chunks(text: str, limit: int | None = None) -> list[str]:
+    """Split a long reply into chunks under limit characters (prefer newlines).
+
+    Cuts by position only — no rstrip/lstrip at boundaries — so
+    ''.join(chunks) always equals the original text.
+    """
+    if limit is None:
+        limit = config.message_chunk_chars
+    if limit <= 0:
+        return [text or ""]
+    text = text or ""
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            chunks.append(rest)
+            break
+        window = rest[:limit]
+        # Prefer break at newline, then space; never cut at <=0 (would infinite-loop)
+        cut = window.rfind("\n")
+        if cut <= 0 or cut < limit // 3:
+            cut = window.rfind(" ")
+        if cut <= 0 or cut < limit // 3:
+            cut = limit
+        chunks.append(rest[:cut])
+        rest = rest[cut:]
+    # Drop pure-empty pieces only (should not happen with cut > 0)
+    return [c for c in chunks if c != ""] or [""]
 
 
 async def terminate_process(process, graceful: bool = True) -> None:

@@ -1,2 +1,2 @@
 """WeChatBridge — bridge WeChat messages to agy CLI."""
-__version__ = "1.2.1"
+__version__ = "1.2.2"

@@ -15,10 +15,10 @@ import urllib.parse
 
 from .config import config
 from .runner_common import (
-    sanitize_user_id, get_session_dir, is_first_message, mark_initialized,
+    sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
-    format_error, format_cli_error, EMPTY_REPLY,
+    format_error, format_cli_error, EMPTY_REPLY, validate_add_dir,
 )
 
 logger = logging.getLogger("grok_runner")
@@ -92,9 +92,13 @@ def ensure_user_grok(user_id: str) -> str:
     the machine-level `grok login`, not a stale one-shot copy.
     Returns session_dir path (for use as HOME when running grok).
     """
-    session_dir = get_session_dir(user_id)
+    session_dir = ensure_session_dir(user_id)
     grok_dir = os.path.join(session_dir, ".grok")
     os.makedirs(grok_dir, exist_ok=True)
+    try:
+        os.chmod(grok_dir, 0o700)
+    except OSError:
+        pass
 
     _sync_grok_auth(grok_dir)
 
@@ -623,13 +627,20 @@ async def handle_grok_slash_command(text: str, user_id: str) -> str | None:
         path = args.strip()
         if not path:
             return "❌ **缺少参数** ❌\n\n`/add-dir <路径>`"
+        ok, result = validate_add_dir(path, user_id)
+        if not ok:
+            return f"❌ **目录不允许** ❌\n\n{result}"
+        resolved = result
         prefs = load_prefs(user_id)
         dirs = prefs.get("add_dirs", [])
-        if path not in dirs:
-            dirs.append(path)
+        if resolved not in dirs:
+            dirs.append(resolved)
             prefs["add_dirs"] = dirs
             save_prefs(user_id, prefs)
-        return f"✅ **已记录工作目录** ✅\n\n```\n{path}\n```\n\nℹ️ grok 后端暂不支持通过命令行传递额外目录。"
+        return (
+            f"✅ **已记录工作目录** ✅\n\n```\n{resolved}\n```\n\n"
+            "ℹ️ grok 后端暂不支持通过命令行传递额外目录。"
+        )
 
     if cmd == "/agents":
         output = await _run_grok_subcommand(["agent"], user_id)

@@ -21,7 +21,7 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 - 每个微信用户有独立的工作区和会话
 - **运行时切换后端**：`/backend agy` 或 `/backend grok`，不用重启
 - slash 指令：`/model`、`/clear`、`/fast`、`/persona`、`/backend` 等
-- 危险操作（删除、格式化、`rm -rf`）执行前先确认
+- 危险操作（`rm -rf /`、格式化磁盘等明确破坏性指令）执行前先确认
 - 白名单限定指定微信 ID 才能用
 - `/mcp`、`/agent` 引导后端的 MCP 工具和子代理
 - 媒体走微信 CDN，AES 加密传输
@@ -85,7 +85,7 @@ cp deploy/wechatbridge.env.example .env
 | `WECHATBRIDGE_BACKEND` | `agy` | 全局默认后端（`agy` 或 `grok`，可被 `/backend` 覆盖） |
 | `WECHATBRIDGE_INSTANCE` | `default` | 实例名，多实例部署时区分（所有路径从它派生） |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _空_ | 允许使用的微信 ID，逗号分隔（空 = 全开） |
-| `AGY_TIMEOUT` | `3600` | CLI 执行超时秒数（默认 60 分钟） |
+| `AGY_TIMEOUT` | `600` | CLI 执行超时秒数（默认 10 分钟；长任务可自行调大） |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | 回传微信的文件大小上限（100 MB） |
 
 完整列表见 [`deploy/wechatbridge.env.example`](deploy/wechatbridge.env.example)。
