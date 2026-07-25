@@ -9,6 +9,8 @@ WorkingDirectory=/opt/wechatbridge
 ExecStart=/usr/bin/python3 -m wechatbridge
 Restart=always
 RestartSec=5s
+# Load environment variables from .env file (optional)
+EnvironmentFile=-/opt/wechatbridge/.env
 # Create a dedicated system user if running under a non-root account
 User=wechatbridge
 

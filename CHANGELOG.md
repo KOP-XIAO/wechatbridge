@@ -5,6 +5,21 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Changed
+
+- Made all default paths cross-platform using `~`-relative locations (`session_base_dir`, `agy_scratch_dir`), replacing hardcoded `/var/lib/...` and `/root/...` paths.
+- Added `USERPROFILE` environment variable for agy subprocess on Windows (alongside `HOME` for Unix).
+- Guarded `os.getpgid` / `os.killpg` / `signal.SIGKILL` calls with `hasattr` checks; Windows falls back to `process.kill()` for timeout and error cleanup.
+- Removed stale root-level duplicate scripts (`agy_runner.py`, `config.py`, `ilink.py`, `main.py`) that were out of sync with the `wechatbridge/` subpackage.
+- Bumped version to 1.1.0; synced `__init__.py` and `pyproject.toml` version numbers.
+- Updated systemd service template to use `python -m wechatbridge` entry point with optional `EnvironmentFile` support.
+
+### Added
+
+- `deploy/wechatbridge.plist` — macOS launchd service template.
+- `deploy/wechatbridge-windows.md` — Windows deployment guide.
+- Platform Support section in both `README.md` and `README.zh-CN.md`.
+
 ## [1.0.6] - 2026-07-23
 
 ### Changed

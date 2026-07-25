@@ -26,6 +26,14 @@ WeChatBridge 把微信机器人接到 agy（谷歌的 Antigravity CLI）。你�
 - 媒体经微信 CDN 用 AES-128-ECB 加密传输
 - 附带 systemd 服务文件，自动重启
 
+## 平台支持
+
+- **Linux** — 主要平台，完整支持（附带 systemd 服务文件）
+- **macOS** — 开箱即用
+- **Windows** — 开箱即用
+
+所有默认路径基于 `~` 展开，三个平台均可正确解析。
+
 ## 前置条件
 
 - **agy**（谷歌 Antigravity CLI），已安装并登录。`agy` 在 `PATH` 里，或者设 `AGY_BIN_PATH`。Antigravity CLI 是谷歌的终端 agentic 编程工具：能理解代码库、经授权编辑文件、在终端跑命令，是 Gemini CLI 的官方继任者。
@@ -60,7 +68,7 @@ cp deploy/wechatbridge.env.example .env
 |---|---|---|
 | `AGY_BIN_PATH` | `agy` | agy 可执行文件路径 |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _空_ | 允许使用桥的微信 ID，逗号分隔（空 = 全开） |
-| `AGY_TIMEOUT` | `900` | agy 执行超时秒数（默认 15 分钟） |
+| `AGY_TIMEOUT` | `3600` | agy 执行超时秒数（默认 60 分钟） |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | 回传微信的文件大小上限（100 MB） |
 
 完整列表见 [`deploy/wechatbridge.env.example`](deploy/wechatbridge.env.example)。

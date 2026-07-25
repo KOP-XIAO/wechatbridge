@@ -26,6 +26,14 @@ The bridge long-polls iLink for incoming messages, runs an `agy` subprocess per 
 - Media is encrypted with AES-128-ECB over the WeChat CDN
 - systemd unit with auto-restart included
 
+## Platform Support
+
+- **Linux** — primary, fully supported (systemd unit included)
+- **macOS** — supported out of the box
+- **Windows** — supported out of the box
+
+All default paths use `~`-relative locations that resolve correctly on all three platforms.
+
 ## Prerequisites
 
 - **agy** (Google's Antigravity CLI), installed and authenticated. Either have `agy` in `PATH` or set `AGY_BIN_PATH`. Antigravity CLI is Google's terminal-first agentic coding tool: it understands your codebase, edits files with your permission, and runs commands from the terminal. It's the official successor to Gemini CLI.
@@ -73,13 +81,29 @@ python -m wechatbridge
 
 On first run the bridge prints a QR code. Scan it with WeChat to bind the bot, after which it long-polls for messages.
 
-## Deploy with systemd
+## Deploy
+
+### Linux (systemd)
 
 ```bash
 sudo cp deploy/wechatbridge.service /etc/systemd/system/
-# edit WorkingDirectory and add an EnvironmentFile= line to the unit
+# edit WorkingDirectory and User to match your setup
 sudo systemctl enable --now wechatbridge
 ```
+
+### macOS (launchd)
+
+```bash
+cp deploy/wechatbridge.plist ~/Library/LaunchAgents/com.wechatbridge.plist
+# edit WorkingDirectory and ProgramArguments paths in the plist
+launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
+```
+
+### Windows (Task Scheduler)
+
+See [`deploy/wechatbridge-windows.md`](deploy/wechatbridge-windows.md) for setup instructions.
+
+See [`deploy/wechatbridge.env.example`](deploy/wechatbridge.env.example) for all configuration options. All paths default to `~`-relative locations and work cross-platform.
 
 ## Slash commands
 

@@ -63,7 +63,8 @@ class AppConfig:
 
     # Base directory for per-user session workspaces
     session_base_dir: str = os.getenv(
-        "WECHATBRIDGE_SESSION_DIR", "/var/lib/wechatbridge/sessions"
+        "WECHATBRIDGE_SESSION_DIR",
+        os.path.join(os.path.expanduser("~"), ".local", "share", "wechatbridge", "sessions"),
     )
 
     # State file for bot_token persistence
