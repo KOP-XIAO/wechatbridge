@@ -7,10 +7,13 @@ Type=simple
 # Adjust WorkingDirectory to your installation path
 WorkingDirectory=/opt/wechatbridge
 ExecStart=/usr/bin/python3 -m wechatbridge
-Restart=always
-RestartSec=5s
 # Load environment variables from .env file (optional)
 EnvironmentFile=-/opt/wechatbridge/.env
+# Instance name for multi-instance deployments (default, bot2, etc.)
+# All per-instance paths (state/session/qrcode) derive from this.
+Environment=WECHATBRIDGE_INSTANCE=default
+Restart=always
+RestartSec=5s
 # Create a dedicated system user if running under a non-root account
 User=wechatbridge
 

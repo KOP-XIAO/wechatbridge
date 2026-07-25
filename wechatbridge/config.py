@@ -54,37 +54,57 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# ---------------------------------------------------------------------------
+# Instance identity — all per-instance paths derive from this
+# ---------------------------------------------------------------------------
+_instance = os.getenv("WECHATBRIDGE_INSTANCE", "default")
+_instance_data_dir = os.path.join(
+    os.path.expanduser("~"), ".local", "share", "wechatbridge", _instance
+)
+
+
 class AppConfig:
     # iLink base URL (no trailing slash)
     ilink_base_url: str = os.getenv("ILINK_BASE_URL", "https://ilinkai.weixin.qq.com")
 
-    # agy binary path
+    # Active CLI backend: "agy" or "grok" (global default, can be overridden per-user via /backend)
+    backend: str = os.getenv("WECHATBRIDGE_BACKEND", "agy").lower()
+    if backend not in ("agy", "grok"):
+        logger.warning("Unknown backend %r, falling back to 'agy'", backend)
+        backend = "agy"
+
+    # agy CLI binary path
     agy_binary_path: str = os.getenv("AGY_BIN_PATH", "agy")  # default assumes in PATH
 
-    # Base directory for per-user session workspaces
+    # grok CLI binary path
+    grok_binary_path: str = os.getenv("GROK_BIN_PATH", "grok")  # default assumes in PATH
+
+    # Instance name (for multi-instance deployments)
+    instance: str = _instance
+
+    # Per-instance paths (derived from instance, can be overridden by explicit env vars)
     session_base_dir: str = os.getenv(
         "WECHATBRIDGE_SESSION_DIR",
-        os.path.join(os.path.expanduser("~"), ".local", "share", "wechatbridge", "sessions"),
+        os.path.join(_instance_data_dir, "sessions"),
     )
 
-    # State file for bot_token persistence
     state_file_path: str = os.getenv(
-        "WECHATBRIDGE_STATE_FILE", os.path.join(_BASE_DIR, ".ilink_state.json")
+        "WECHATBRIDGE_STATE_FILE",
+        os.path.join(_instance_data_dir, ".ilink_state.json"),
     )
 
-    # QR code PNG save path
     qrcode_png_path: str = os.getenv(
-        "WECHATBRIDGE_QRCODE_PATH", os.path.join(_BASE_DIR, "qrcode.png")
+        "WECHATBRIDGE_QRCODE_PATH",
+        os.path.join(_instance_data_dir, "qrcode.png"),
     )
 
-    # QR code URL file path (for external access)
     qrcode_url_path: str = os.getenv(
-        "WECHATBRIDGE_QRCODE_URL_FILE", os.path.join(_BASE_DIR, ".current_qrcode_url.txt")
+        "WECHATBRIDGE_QRCODE_URL_FILE",
+        os.path.join(_instance_data_dir, ".current_qrcode_url.txt"),
     )
 
-    # Timeout for agy execution (seconds) — default 3600s (60 minutes / 1 hour)
+    # Timeout for CLI execution (seconds) — default 3600s (60 minutes / 1 hour)
     agy_timeout: int = _env_int("AGY_TIMEOUT", 3600)
-
 
     # QR code polling timeout (seconds)
     qrcode_poll_timeout: int = _env_int("QRCODE_POLL_TIMEOUT", 180)
@@ -99,7 +119,7 @@ class AppConfig:
     cdn_base_url: str = os.getenv("WECHATBRIDGE_CDN_BASE", "https://novac2c.cdn.weixin.qq.com/c2c")
 
     # agy scratch directory (where agy writes generated files)
-    agy_scratch_dir: str = os.getenv("AGY_SCRATCH_DIR", os.path.expanduser("~/.gemini/antigravity-cli/scratch"))  # agy generated artifacts scratch dir
+    agy_scratch_dir: str = os.getenv("AGY_SCRATCH_DIR", os.path.expanduser("~/.gemini/antigravity-cli/scratch"))
 
     # Scratch file retention days (TTL cleanup)
     scratch_retention_days: int = _env_int("AGY_SCRATCH_RETENTION_DAYS", 7)

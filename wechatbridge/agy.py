@@ -3,7 +3,6 @@ agy CLI runner with per-user session isolation, output cleanup, and timeout prot
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -14,13 +13,14 @@ import sys
 import time
 
 from .config import config
+from .runner_common import (
+    sanitize_user_id, get_session_dir, is_first_message, mark_initialized,
+    clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
+    sanitize_env, terminate_process,
+    ANSI_RE, HTML_TAG_RE,
+)
 
 logger = logging.getLogger("agy_runner")
-
-# ANSI escape code pattern
-ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-# HTML tag pattern
-HTML_TAG_RE = re.compile(r"<[^>]+>")
 
 
 def extract_artifacts(text: str) -> list[tuple[str, str]]:
@@ -43,82 +43,6 @@ def extract_artifacts(text: str) -> list[tuple[str, str]]:
     if result:
         logger.debug("Extracted %d artifacts: %s", len(result), [n for n, _ in result[:3]])
     return result
-
-
-def sanitize_user_id(user_id: str) -> str:
-    """Convert a WeChat user ID to a filesystem-safe directory name.
-
-    Uses a short hash suffix for uniqueness while keeping a readable prefix.
-    """
-    h = hashlib.sha256(user_id.encode()).hexdigest()[:12]
-    safe = re.sub(r"[^a-zA-Z0-9_]", "_", user_id)[:48]
-    return f"{safe}_{h}"
-
-
-def get_session_dir(user_id: str) -> str:
-    """Get the per-user session directory path."""
-    return os.path.join(config.session_base_dir, sanitize_user_id(user_id))
-
-
-def is_first_message(session_dir: str) -> bool:
-    """Check if this user has no existing conversation."""
-    return not os.path.exists(os.path.join(session_dir, ".initialized"))
-
-
-def mark_initialized(session_dir: str) -> None:
-    """Create .initialized flag file after first message."""
-    try:
-        os.makedirs(session_dir, exist_ok=True)
-        with open(os.path.join(session_dir, ".initialized"), "w") as f:
-            f.write("1")
-    except OSError as e:
-        logger.error("Failed to mark session initialized: %s", e)
-
-
-def clean_output(text: str) -> str:
-    """Remove ANSI escape codes and HTML tags from agy output."""
-    text = ANSI_RE.sub("", text)
-    text = HTML_TAG_RE.sub("", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-# ---------------------------------------------------------------------------
-# Per-user preference persistence
-# ---------------------------------------------------------------------------
-
-def load_prefs(user_id: str) -> dict:
-    """Load per-user preferences from prefs.json.
-
-    Returns a dict with keys: model, effort, mode, add_dirs.
-    Missing keys are filled from defaults.
-    """
-    session_dir = get_session_dir(user_id)
-    prefs_path = os.path.join(session_dir, "prefs.json")
-    default_prefs = {"model": "", "effort": "", "mode": "", "add_dirs": []}
-    try:
-        if os.path.exists(prefs_path):
-            with open(prefs_path, "r") as f:
-                data = json.load(f)
-            for k in default_prefs:
-                if k not in data:
-                    data[k] = default_prefs[k]
-            return data
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("Failed to load prefs for %s: %s", user_id, e)
-    return dict(default_prefs)
-
-
-def save_prefs(user_id: str, prefs: dict) -> None:
-    """Save per-user preferences to prefs.json."""
-    session_dir = get_session_dir(user_id)
-    os.makedirs(session_dir, exist_ok=True)
-    prefs_path = os.path.join(session_dir, "prefs.json")
-    try:
-        with open(prefs_path, "w") as f:
-            json.dump(prefs, f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        logger.error("Failed to save prefs for %s: %s", user_id, e)
 
 
 def ensure_user_gemini(user_id: str) -> str:
@@ -157,46 +81,9 @@ def ensure_user_gemini(user_id: str) -> str:
     return session_dir
 
 
-# Confirm gate: hardcoded dangerous keyword fallbacks (used when config.confirm_keywords is empty)
-# Confirm gate: hardcoded dangerous keyword fallbacks (used when config.confirm_keywords is empty)
-# 宁枉勿纵 — 自然语言危险意图词也触发确认，日常误触多一轮确认即可取消
-_DANGEROUS_KEYWORDS = [
-    "rm -rf /", "curl |sh", "curl | bash", "wget -o- | sh",
-    "删掉", "删除", "清空", "卸载", "格式化",
-]
-
-
-def is_dangerous(prompt: str) -> bool:
-    """Check if a prompt contains dangerous keywords.
-
-    Uses config.confirm_keywords if non-empty, otherwise falls back to
-    the hardcoded _DANGEROUS_KEYWORDS list (matching existing audit behavior).
-    """
-    keywords = config.confirm_keywords if config.confirm_keywords else _DANGEROUS_KEYWORDS
-    lower = prompt.lower()
-    for kw in keywords:
-        if kw in lower:
-            return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # agy CLI execution
 # ---------------------------------------------------------------------------
-
-def parse_model_effort(model: str) -> tuple[str, str | None]:
-    """Split 'gemini-3.6-flash-high' -> ('gemini-3.6-flash', 'high').
-
-    Returns (base_model, embedded_effort) where embedded_effort is None if
-    the model name does not end with -high, -medium, or -low.
-    """
-    for suffix in ("-high", "-medium", "-low"):
-        if model.endswith(suffix):
-            base = model[: -len(suffix)]
-            effort = suffix[1:]  # strip leading dash
-            return base, effort
-    return model, None
-
 
 async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, list]:
     """Execute agy CLI for a given user message.
@@ -271,10 +158,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
 
     process = None
     try:
-        env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("TOKEN","KEY","SECRET","PASSWORD","AWS","GITHUB","GITLAB","CREDENTIAL"))}
-        env["HOME"] = session_dir
-        if sys.platform == "win32":
-            env["USERPROFILE"] = session_dir
+        env = sanitize_env(session_dir)
         env["PAGER"] = "cat"
         env["CI"] = "true"
         env["NONINTERACTIVE"] = "1"
@@ -364,49 +248,12 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
             timeout,
             user_id,
         )
-        if process and process.pid:
-            try:
-                if hasattr(os, "getpgid") and hasattr(os, "killpg"):
-                    pgid = os.getpgid(process.pid)
-                    # First send SIGTERM for graceful shutdown to let agy release SQLite WAL & Cascade locks
-                    os.killpg(pgid, signal.SIGTERM)
-                    logger.info("Sent SIGTERM to process group %s for graceful lock release", pgid)
-                    # Grace period: wait up to 2 seconds for process to exit
-                    for _ in range(20):
-                        if process.returncode is not None:
-                            break
-                        await asyncio.sleep(0.1)
-                    if process.returncode is None:
-                        # Force kill with SIGKILL if still running after grace period
-                        os.killpg(pgid, signal.SIGKILL)
-                        logger.info("Sent SIGKILL to process group %s after grace period", pgid)
-                else:
-                    # Windows: no process groups, kill directly
-                    process.kill()
-                    logger.info("Killed agy process %s directly (non-Unix)", process.pid)
-            except (ProcessLookupError, PermissionError, OSError) as e:
-                logger.warning("Failed to terminate process: %s", e)
-            try:
-                await process.wait()
-            except Exception:
-                pass
+        await terminate_process(process, graceful=True)
         return "⏰ **处理超时** ⏰", []
 
     except Exception as e:
         logger.exception("Unexpected error running agy: %s", e)
-        if process and process.pid:
-            try:
-                if hasattr(os, "getpgid") and hasattr(os, "killpg"):
-                    pgid = os.getpgid(process.pid)
-                    os.killpg(pgid, signal.SIGKILL)
-                else:
-                    process.kill()
-            except Exception as e:
-                logger.warning("子进程清理失败: %s", e)
-            try:
-                await process.wait()
-            except Exception as e:
-                logger.warning("子进程清理失败: %s", e)
+        await terminate_process(process, graceful=False)
         return f"❌ **执行出错** ❌\n\n```\n{str(e)}\n```", []
 
 
@@ -424,10 +271,7 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
     session_dir = ensure_user_gemini(user_id)
     cmd = [config.agy_binary_path] + subcmd_args
     try:
-        env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("TOKEN","KEY","SECRET","PASSWORD","AWS","GITHUB","GITLAB","CREDENTIAL"))}
-        env["HOME"] = session_dir
-        if sys.platform == "win32":
-            env["USERPROFILE"] = session_dir
+        env = sanitize_env(session_dir)
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -464,11 +308,12 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
 def _cmd_help() -> str:
     """Build /help response listing all supported slash commands."""
     lines = [
-        "📋 **wechatbridge 支持指令** 📋",
+        "📋 **wechatbridge 支持指令 (agy)** 📋",
         "",
         "**模型控制**",
         "- `/model <名称>` — 切换模型（用 `/models` 查看可用列表）",
         "- `/models` — 查看可用模型列表",
+        "- `/backend <agy|grok>` — 切换后端 CLI",
         "",
         "**对话控制**",
         "- `/clear` 或 `/new` — 重置对话（开始新会话）",

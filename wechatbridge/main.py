@@ -1,7 +1,7 @@
 """
 wechatbridge Main Entry Point.
-Active iLink client that receives WeChat messages and responds via agy CLI.
-Architecture: WeChat ClawBot(iLink) <-> wechatbridge(Python) <-> agy CLI
+Active iLink client that receives WeChat messages and responds via CLI backends.
+Architecture: WeChat ClawBot(iLink) <-> wechatbridge(Python) <-> agy/grok CLI
 """
 
 import asyncio
@@ -15,7 +15,7 @@ from io import StringIO
 
 from .config import config
 from .ilink import ILinkClient
-from .agy import run_agy, handle_slash_command, get_session_dir, is_dangerous
+from .runner_common import get_session_dir, is_dangerous, load_prefs, save_prefs
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -29,6 +29,82 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Pending dangerous prompt confirmations (user_id -> {prompt, expire_at, context_token})
 pending_confirms: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# Backend dispatcher — routes to agy or grok based on per-user preference
+# ---------------------------------------------------------------------------
+
+def _get_backend(user_id: str) -> str:
+    """Get the active backend for a user (from prefs, fallback to global config)."""
+    prefs = load_prefs(user_id)
+    return prefs.get("backend", config.backend)
+
+
+async def _run_llm(prompt: str, user_id: str) -> tuple[str, list]:
+    """Dispatch prompt to the active backend's run function."""
+    backend = _get_backend(user_id)
+    if backend == "grok":
+        from .grok import run_grok
+        return await run_grok(prompt, user_id)
+    else:
+        from .agy import run_agy
+        return await run_agy(prompt, user_id)
+
+
+async def _handle_slash(text: str, user_id: str) -> str | None:
+    """Dispatch slash command to the active backend's handler.
+
+    /backend is a meta-command handled here, not delegated to backends.
+    """
+    parts = text.strip().split(maxsplit=1)
+    cmd = parts[0].lower() if parts else ""
+    args = parts[1] if len(parts) > 1 else ""
+
+    # /backend is a meta-command — switch CLI backend per user
+    if cmd == "/backend":
+        return _cmd_backend(args, user_id)
+
+    backend = _get_backend(user_id)
+    if backend == "grok":
+        from .grok import handle_grok_slash_command
+        return await handle_grok_slash_command(text, user_id)
+    else:
+        from .agy import handle_slash_command
+        return await handle_slash_command(text, user_id)
+
+
+def _cmd_backend(args: str, user_id: str) -> str:
+    """Handle /backend <agy|grok> — switch CLI backend per user.
+
+    Switching resets the conversation (.initialized flag) so the new
+    backend starts a fresh session.
+    """
+    name = args.strip().lower()
+    if not name:
+        current = _get_backend(user_id)
+        return (
+            f"📋 **当前后端** 📋\n\n`{current}`\n\n"
+            "用法: `/backend agy` 或 `/backend grok`"
+        )
+    if name not in ("agy", "grok"):
+        return "❌ **未知后端** ❌\n\n支持: `agy` / `grok`\n\n`/backend agy` 或 `/backend grok`"
+    prefs = load_prefs(user_id)
+    old = prefs.get("backend", config.backend)
+    prefs["backend"] = name
+    save_prefs(user_id, prefs)
+    # Reset session so new backend starts fresh
+    session_dir = get_session_dir(user_id)
+    flag = os.path.join(session_dir, ".initialized")
+    if os.path.exists(flag):
+        os.remove(flag)
+    if old == name:
+        return f"📋 **当前后端** 📋\n\n`{name}`（未变化）"
+    return (
+        f"✅ **后端已切换** ✅\n\n`{old}` → `{name}`\n\n"
+        "⚠️ 对话已重置，新后端将开始新会话。"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Image file extension detection
@@ -136,13 +212,24 @@ async def gate_and_run(client, from_user, context_token, prompt) -> tuple[str, l
         )
         logger.warning("[AUDIT] dangerous prompt pending confirmation: user=%s prompt=%.200s", from_user, prompt)
         return None
-    return await run_agy(prompt, from_user)
+    return await _run_llm(prompt, from_user)
 
 
 async def send_artifacts_back(client, from_user, context_token, artifacts) -> None:
-    """Filter artifacts: only send back those under per-user session scratch dir."""
-    user_scratch = os.path.join(get_session_dir(from_user), '.gemini', 'antigravity-cli', 'scratch')
-    scratch_prefix = os.path.abspath(user_scratch) + os.sep
+    """Filter artifacts: only send back those under per-user session dir.
+
+    For agy: artifacts under .gemini/antigravity-cli/scratch
+    For grok: artifacts under session_dir (cwd where grok ran)
+    """
+    session_dir = get_session_dir(from_user)
+    backend = _get_backend(from_user)
+    if backend == "grok":
+        # grok runs with cwd=session_dir, artifacts are under session_dir
+        scratch_prefix = os.path.abspath(session_dir) + os.sep
+    else:
+        # agy writes to .gemini/antigravity-cli/scratch under session_dir
+        user_scratch = os.path.join(session_dir, '.gemini', 'antigravity-cli', 'scratch')
+        scratch_prefix = os.path.abspath(user_scratch) + os.sep
     for art_name, art_path in artifacts:
         try:
             if not os.path.abspath(art_path).startswith(scratch_prefix):
@@ -185,8 +272,8 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
     """Process a single WeChat message.
 
     - Image messages (type==2 item): download, AES decrypt, detect ext, save,
-      then run agy with ``prompt @path`` for image recognition.
-    - Text-only messages: original logic (slash interception + run_agy).
+      then run CLI with ``prompt @path`` for image recognition.
+    - Text-only messages: original logic (slash interception + run_llm).
 
     Image messages bypass slash command interception; the text caption (if any)
     is used as the prompt, otherwise a default prompt is used.
@@ -254,7 +341,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
         if not expired and text.strip().lower() == config.confirm_token.lower():
             # User confirmed → run pending prompt, send reply, return
             logger.info("[AUDIT] user=%s confirmed dangerous prompt", from_user)
-            reply, artifacts = await run_agy(pending["prompt"], from_user)
+            reply, artifacts = await _run_llm(pending["prompt"], from_user)
             del pending_confirms[from_user]
             # Send reply
             success = await client.send_message(
@@ -376,9 +463,9 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
         # Slash command interception
         if text.startswith("/"):
             logger.info("Slash command from=%s: %.200s", from_user, text)
-            reply = await handle_slash_command(text, from_user)
+            reply = await _handle_slash(text, from_user)
             if reply is None:
-                # D class: passthrough — run agy normally
+                # D class: passthrough — run CLI normally
                 result = await gate_and_run(client, from_user, context_token, text)
                 if result is None:
                     return
@@ -443,35 +530,10 @@ async def periodic_clean_scratch():
             logger.exception("periodic_clean_scratch error: %s", e)
 
 
-async def main_loop():
-    """Outer loop: login → long-poll messages → re-login on token expiry."""
-    clean_scratch()
-    asyncio.create_task(periodic_clean_scratch())
-# ---------------------------------------------------------------------------
-# Per-user async execution lock and background task spawner
-# ---------------------------------------------------------------------------
-user_locks: dict = {}
-
-
-async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
-    """Run process_message inside a per-user lock as a background task.
-
-    This ensures the main get_updates long-polling loop is NEVER blocked,
-    keeping WeChat heartbeats 100% active while ensuring per-user message ordering.
-    """
-    from_user = msg.get("from_user_id", "")
-    if from_user not in user_locks:
-        user_locks[from_user] = asyncio.Lock()
-
-    async with user_locks[from_user]:
-        try:
-            await process_message(client, msg)
-        except Exception as e:
-            logger.exception("处理消息异常 (from=%s): %s", from_user, e)
-
-
 async def main_loop() -> None:
     """Main daemon loop: manages state, QR login, and message receiving."""
+    clean_scratch()
+    asyncio.create_task(periodic_clean_scratch())
     while True:
         client = ILinkClient()
         try:
@@ -527,7 +589,6 @@ async def main_loop() -> None:
         finally:
             await client.close()
 
-
         # Decide whether to re-login or exit
         if not client.state.bot_token:
             logger.info("Bot token 已失效，重新执行登录流程...")
@@ -540,10 +601,33 @@ async def main_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-user async execution lock and background task spawner
+# ---------------------------------------------------------------------------
+user_locks: dict = {}
+
+
+async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
+    """Run process_message inside a per-user lock as a background task.
+
+    This ensures the main get_updates long-polling loop is NEVER blocked,
+    keeping WeChat heartbeats 100% active while ensuring per-user message ordering.
+    """
+    from_user = msg.get("from_user_id", "")
+    if from_user not in user_locks:
+        user_locks[from_user] = asyncio.Lock()
+
+    async with user_locks[from_user]:
+        try:
+            await process_message(client, msg)
+        except Exception as e:
+            logger.exception("处理消息异常 (from=%s): %s", from_user, e)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    logger.info("wechatbridge 启动")
+    logger.info("wechatbridge 启动 (backend=%s, instance=%s)", config.backend, config.instance)
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:

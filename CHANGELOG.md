@@ -14,6 +14,26 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - Bumped version to 1.1.0; synced `__init__.py` and `pyproject.toml` version numbers.
 - Updated systemd service template to use `python -m wechatbridge` entry point with optional `EnvironmentFile` support.
 
+## [1.2.0] - 2026-07-25
+
+### Added
+
+- **Grok Build backend**: support for xAI Grok Build CLI as an alternative to agy, switchable per-user at runtime via `/backend agy|grok` command.
+- **Runtime backend switching**: `/backend` slash command to switch CLI backend without restarting; each backend has isolated sessions, persona, and model preferences.
+- **Multi-instance support**: `WECHATBRIDGE_INSTANCE` env var; all per-instance paths (state/session/qrcode) derive from the instance name. Deploy N instances with identical service templates.
+- **Instance-derived paths**: state/session/qrcode files now live under `~/.local/share/wechatbridge/<instance>/` by default.
+- Grok artifact extraction via structured `chat_history.jsonl` tool_calls (write/edit file_path).
+- Persona injection for grok via `--rules` flag.
+- `GROK_BIN_PATH` and `WECHATBRIDGE_BACKEND` config options.
+
+### Changed
+
+- Refactored shared logic (session isolation, prefs, process management, dangerous detection) into `runner_common.py` module.
+- `agy.py` and new `grok.py` both import from `runner_common.py`; behavior unchanged for agy users.
+- `main.py` now dispatches to active backend based on per-user preference.
+- Startup log shows active backend and instance name.
+
+
 ### Added
 
 - `deploy/wechatbridge.plist` — macOS launchd service template.

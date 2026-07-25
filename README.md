@@ -34,6 +34,15 @@ The bridge long-polls iLink for incoming messages, runs an `agy` subprocess per 
 
 All default paths use `~`-relative locations that resolve correctly on all three platforms.
 
+## CLI Backends
+
+WeChatBridge supports multiple agentic CLI backends, switchable per-user at runtime via the `/backend` command:
+
+- **agy** (default) — Google Antigravity CLI
+- **grok** — xAI Grok Build CLI
+
+Switch with `/backend agy` or `/backend grok` in your WeChat chat. Each backend gets its own isolated session, persona, and model preferences.
+
 ## Prerequisites
 
 - **agy** (Google's Antigravity CLI), installed and authenticated. Either have `agy` in `PATH` or set `AGY_BIN_PATH`. Antigravity CLI is Google's terminal-first agentic coding tool: it understands your codebase, edits files with your permission, and runs commands from the terminal. It's the official successor to Gemini CLI.
@@ -89,6 +98,9 @@ On first run the bridge prints a QR code. Scan it with WeChat to bind the bot, a
 sudo cp deploy/wechatbridge.service /etc/systemd/system/
 # edit WorkingDirectory and User to match your setup
 sudo systemctl enable --now wechatbridge
+
+# Multi-instance: set WECHATBRIDGE_INSTANCE in each unit to isolate state/sessions.
+# All per-instance paths derive from the instance name automatically.
 ```
 
 ### macOS (launchd)
