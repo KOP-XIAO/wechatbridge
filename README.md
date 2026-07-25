@@ -5,14 +5,14 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge connects a WeChat bot to agy (Google's Antigravity CLI). You can read files, run commands, fetch web pages, and get generated files back, all from a WeChat chat.
+WeChatBridge connects a WeChat bot to agentic coding CLIs (Google's agy / Antigravity, or xAI's Grok Build). You can read files, run commands, fetch web pages, and get generated files back, all from a WeChat chat.
 
 ```
-WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy CLI
+WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok CLI
                                      (this project)    (runs tools)
 ```
 
-The bridge long-polls iLink for incoming messages, runs an `agy` subprocess per user, and sends the reply back. Files agy creates go back to WeChat through the CDN.
+The bridge long-polls iLink for incoming messages, runs an `agy` or `grok` subprocess per user (switchable via `/backend`), and sends the reply back. Files the CLI creates go back to WeChat through the CDN.
 
 ## Features
 
@@ -122,8 +122,9 @@ See [`deploy/wechatbridge.env.example`](deploy/wechatbridge.env.example) for all
 | Command | Action |
 |---|---|
 | `/help` | list supported commands |
+| `/backend <agy|grok>` | switch CLI backend (per-user) |
 | `/clear` or `/new` | reset the session |
-| `/model <name>` | switch agy model (see `/models`) |
+| `/model <name>` | switch model (see `/models`) |
 | `/models` | list available models |
 | `/fast` | toggle fast mode (low reasoning effort) |
 | `/planning` | toggle planning mode |
@@ -133,7 +134,7 @@ See [`deploy/wechatbridge.env.example`](deploy/wechatbridge.env.example) for all
 | `/mcp` | MCP tool usage guidance |
 | `/agent <name> <task>` | invoke a subagent for a task |
 
-Other `/` commands pass through to agy unchanged.
+Other `/` commands pass through to the active backend (agy or grok) unchanged.
 
 ## Limitations
 
