@@ -20,7 +20,11 @@ python -m wechatbridge
 
 ## Notes
 
-- Default session directory: `%USERPROFILE%\.local\share\wechatbridge\sessions`
-- `HOME` and `USERPROFILE` are both set to the session dir for agy subprocess
+- Default instance data root: `%USERPROFILE%\.local\share\wechatbridge\<instance>\`  
+  (`WECHATBRIDGE_INSTANCE` defaults to `default`)
+- Default session directory: `%USERPROFILE%\.local\share\wechatbridge\<instance>\sessions`
+- State / QR paths also live under that instance root unless overridden by env
+- Multi-instance: run separate processes with different `WECHATBRIDGE_INSTANCE` values
+- Subprocess env sets `HOME` and `USERPROFILE` to the **per-user session dir** (agy and grok)
 - `os.chmod` is a no-op on Windows; token file permissions rely on NTFS ACLs
-- `os.setsid` (Unix process group) is not used on Windows; agy subprocess inherits the parent's process group
+- `os.setsid` (Unix process group) is not used on Windows; CLI subprocesses inherit the parent's process group

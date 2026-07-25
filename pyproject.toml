@@ -1,7 +1,7 @@
 [project]
 name = "wechatbridge"
 version = "1.2.2"
-description = "Bridge WeChat messages to agy CLI — text/image/file/voice in, agy replies and generated files back."
+description = "Bridge WeChat messages to agy or Grok Build CLIs — text/image/file/voice in, replies and selected artifacts back."
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [

@@ -235,7 +235,11 @@ async def gate_and_run(client, from_user, context_token, prompt) -> tuple[str, l
         }
         await client.send_message(
             to_user_id=from_user,
-            text=f"⚠️ **危险操作确认** ⚠️\n\n```\n{prompt}\n```\n\n- 回复 **y** → 执行\n- 回复其他 → 取消",
+            text=(
+                f"⚠️ **危险操作确认** ⚠️\n\n```\n{prompt}\n```\n\n"
+                f"- 回复 **{config.confirm_token}** → 执行\n"
+                f"- 回复其他 → 取消"
+            ),
             context_token=context_token,
             baseurl=client.state.baseurl,
             bot_token=client.state.bot_token,

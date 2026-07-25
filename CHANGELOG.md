@@ -5,6 +5,13 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Changed
+
+- Bilingual READMEs aligned with real capabilities: dual backend (agy/grok), tightened wording for danger gate, artifacts, `/mcp`/`/agent`, `/fast`/`/planning`, grok `/add-dir`; added Ops & security section.
+- Dangerous-confirm WeChat prompt now shows `WECHATBRIDGE_CONFIRM_TOKEN` instead of hard-coded `y`.
+- Package description (`pyproject.toml`, package docstring) mentions agy and Grok Build.
+- Windows deploy notes use instance-scoped paths (`…\wechatbridge\<instance>\…`).
+
 ## [1.2.2] - 2026-07-25
 
 ### Security / Hardening
