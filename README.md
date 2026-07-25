@@ -5,20 +5,20 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge connects a WeChat bot to agentic coding CLIs (Google's agy / Antigravity, or xAI's Grok Build). You can read files, run commands, fetch web pages, and get generated files back, all from a WeChat chat.
+WeChatBridge connects a WeChat bot to agentic coding CLIs (Google's agy / Antigravity, or xAI's Grok Build). Read files, run commands, fetch web pages, and get generated files back — all from a WeChat chat. Switch backends anytime with `/backend`.
 
 ```
 WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok CLI
                                      (this project)    (runs tools)
 ```
 
-The bridge long-polls iLink for incoming messages, runs an `agy` or `grok` subprocess per user (switchable via `/backend`), and sends the reply back. Files the CLI creates go back to WeChat through the CDN.
+The bridge listens for WeChat messages via iLink, spawns an `agy` or `grok` subprocess per message (switchable via `/backend`), and sends the reply back. The subprocess runs in single-turn `-p` mode and exits when done, so nothing stays resident. Files the CLI creates go back through the WeChat CDN.
 
 ## Features
 
 - Text, image, file, and voice messages from WeChat all go to agy
 - Files agy generates (documents, images, code) get sent back to WeChat
-- Each WeChat user gets an isolated agy workspace
+- Each WeChat user gets an isolated workspace (per backend)
 - Slash commands for runtime control: `/model`, `/clear`, `/fast`, `/persona`, and more
 - Dangerous prompts (delete, format, `rm -rf`) ask for confirmation before running
 - Sender whitelist to restrict access to specific WeChat IDs
@@ -138,12 +138,12 @@ Other `/` commands pass through to the active backend (agy or grok) unchanged.
 
 ## Limitations
 
-- Requires agy. This is not a standalone agent.
-- Voice accuracy is capped at WeChat's speech-to-text. There's no on-device ASR.
-- No video send or receive. agy has no native video understanding, and parsing video content needs third-party tooling that's out of scope.
-- No native voice bubble output (silk encoding isn't implemented).
-- One bot per process. Run two instances for two WeChat accounts.
-- agy runs with `--dangerously-skip-permissions` (auto-approves every tool call). Restrict access with the sender whitelist and only deploy for trusted users.
+- Requires agy or grok — not a standalone agent.
+- Voice accuracy depends on WeChat's built-in speech-to-text — no local ASR.
+- No video send or receive. Neither agy nor grok natively understands video, and third-party tooling is out of scope.
+- No native voice bubbles (silk encoding not implemented).
+- One bot per process. Multiple WeChat accounts = multiple instances (set `WECHATBRIDGE_INSTANCE` to isolate).
+- Backends run in auto-approve mode (agy: `--dangerously-skip-permissions`; grok: `--always-approve`). Restrict access with the sender whitelist and only deploy for trusted users.
 
 ## Contributing
 
