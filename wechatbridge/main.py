@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import uuid
+from collections import OrderedDict
 from io import StringIO
 
 from . import __version__
@@ -44,6 +45,51 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 pending_confirms: dict = {}
 
 
+# Slash 处理器内部信号：该指令已完整处理（如 /agent 进入确认流程），调用方直接 return
+_HANDLED = object()
+
+# 重登录/关闭前等待在途消息任务的最长时间
+_DRAIN_TIMEOUT_S = 90.0
+
+# 后台任务强引用集合（事件循环只持弱引用，防止任务被 GC 提前回收）
+_background_tasks: set = set()
+
+
+def _spawn_bg(coro) -> asyncio.Task:
+    """create_task + 强引用跟踪，任务结束自动移除。"""
+    t = asyncio.create_task(coro)
+    _background_tasks.add(t)
+    t.add_done_callback(_background_tasks.discard)
+    return t
+
+
+# 已见消息 ID（LRU，上限 1000）——服务端重投/重启重放时跳过重复处理
+_seen_msg_ids: "OrderedDict[str, None]" = OrderedDict()
+_SEEN_MSG_IDS_CAP = 1000
+
+
+def _msg_dedup_key(msg: dict) -> str | None:
+    """从入站消息提取去重键；服务端不下发任何 id 字段时返回 None（无法安全去重）。"""
+    for field in ("message_id", "msg_id", "client_id", "new_msg_id", "seq"):
+        v = msg.get(field)
+        if v:
+            return f"{field}:{v}"
+    return None
+
+
+def _is_duplicate_msg(msg: dict) -> bool:
+    key = _msg_dedup_key(msg)
+    if key is None:
+        return False
+    if key in _seen_msg_ids:
+        return True
+    _seen_msg_ids[key] = None
+    _seen_msg_ids.move_to_end(key)
+    while len(_seen_msg_ids) > _SEEN_MSG_IDS_CAP:
+        _seen_msg_ids.popitem(last=False)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Backend dispatcher — routes to agy or grok based on per-user preference
 # ---------------------------------------------------------------------------
@@ -65,10 +111,16 @@ async def _run_llm(prompt: str, user_id: str) -> tuple[str, list]:
         return await run_agy(prompt, user_id)
 
 
-async def _handle_slash(text: str, user_id: str) -> str | None:
+async def _handle_slash(client: ILinkClient, text: str, user_id: str, context_token: str):
     """Dispatch slash command to the active backend's handler.
 
-    /backend is a meta-command handled here, not delegated to backends.
+    /backend 和 /agent 是元指令，在这里处理，不下发给后端。
+
+    返回值约定：
+      str      — 直接作为回复文本
+      tuple    — (reply, artifacts)，经确认门后的执行结果
+      None     — D 类透传，调用方应把原文交给 gate_and_run
+      _HANDLED — 已完整处理（如 /agent 进入确认流程），调用方直接 return
     """
     parts = text.strip().split(maxsplit=1)
     cmd = parts[0].lower() if parts else ""
@@ -77,6 +129,10 @@ async def _handle_slash(text: str, user_id: str) -> str | None:
     # /backend is a meta-command — switch CLI backend per user
     if cmd == "/backend":
         return _cmd_backend(args, user_id)
+
+    # /agent 也在这里处理：统一走 gate_and_run 确认门，不能绕开 is_dangerous
+    if cmd == "/agent":
+        return await _cmd_agent(client, args, user_id, context_token)
 
     if cmd == "/version":
         return (
@@ -132,6 +188,26 @@ def _cmd_backend(args: str, user_id: str) -> str:
         f"📋 **当前后端** 📋\n\n`{name}`（未变化）\n"
         f"模型: `{model_label}`"
     )
+
+
+async def _cmd_agent(client: ILinkClient, args: str, user_id: str, context_token: str):
+    """Handle /agent <名称> <任务> — 调用子代理执行任务。
+
+    必须经过 gate_and_run 的危险确认门（历史上后端各自实现时绕过了该检查）。
+    """
+    if not config.enable_subagent:
+        return "ℹ️ **该功能已禁用** ℹ️"
+    if not args.strip():
+        return "❌ **缺少参数** ❌\n\n`/agent <名称> <任务>`"
+    agent_parts = args.split(maxsplit=1)
+    agent_name = agent_parts[0]
+    agent_task = agent_parts[1] if len(agent_parts) > 1 else ""
+    crafted = f"请用 invoke_subagent 调用 agent {agent_name} 执行任务：{agent_task}"
+    logger.info("Agent subcmd: user=%s agent=%s task=%.100s", user_id, agent_name, agent_task)
+    result = await gate_and_run(client, user_id, context_token, crafted)
+    if result is None:
+        return _HANDLED  # 已进入危险确认流程
+    return result  # (reply, artifacts)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +293,6 @@ async def login_flow(client: ILinkClient) -> bool:
         bot_token, baseurl = await client.poll_qrcode_status(
             qrcode_str,
             timeout=config.qrcode_poll_timeout,
-            interval=config.qrcode_poll_interval,
         )
         client.state.bot_token = bot_token
         client.state.baseurl = baseurl
@@ -382,14 +457,20 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
     await maybe_notify_admin(client, from_user, context_token)
 
     # ---- Pending dangerous prompt confirmation ----
+    # 确认匹配用文本或语音转写（语音消息也可以回确认口令）
+    reply_text = text.strip() or voice_text.strip()
+    cancelled_notice = ""
     pending = pending_confirms.get(from_user)
     if pending:
         expired = time.time() >= pending["expire_at"]
-        if not expired and text.strip().lower() == config.confirm_token.lower():
+        if not expired and reply_text.lower() == config.confirm_token.lower():
             # User confirmed → run pending prompt, send reply, return
             logger.info("[AUDIT] user=%s confirmed dangerous prompt", from_user)
-            reply, artifacts = await _run_llm(pending["prompt"], from_user)
+            # 先删再执行：执行异常也不能让陈旧 pending 被后续消息误触发
             del pending_confirms[from_user]
+            if image_media or file_media:
+                logger.info("确认回复携带媒体，媒体部分被忽略 from=%s", from_user)
+            reply, artifacts = await _run_llm(pending["prompt"], from_user)
             # Send reply
             success = await client.send_message(
                 to_user_id=from_user,
@@ -409,6 +490,10 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
         if expired:
             # Expired: don't reply, continue normal flow
             logger.info("[AUDIT] user=%s pending expired, continue normal flow", from_user)
+        elif image_media or file_media:
+            # 用户发来新媒体内容：取消待确认并继续处理本条消息（不静默丢弃）
+            logger.info("[AUDIT] user=%s cancelled pending by sending new media", from_user)
+            cancelled_notice = "🚫 已取消待确认的危险操作。\n\n"
         else:
             # User explicitly cancelled: reply cancelled, return
             logger.info("[AUDIT] user=%s cancelled dangerous prompt", from_user)
@@ -462,7 +547,9 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
 
             except Exception as e:
                 logger.exception("图片下载/解密失败: %s", e)
-                reply = format_error("图片下载或解密失败", str(e))
+                # ValueError 是自定义的中文可读原因；其他异常（httpx 等）含内部 URL，不外发
+                detail = str(e) if isinstance(e, ValueError) else "请重新发送图片。"
+                reply = format_error("图片下载或解密失败", detail)
 
     # ---- Case 1.5: Message contains a file (non-image) ----
     elif file_media:
@@ -500,7 +587,9 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
 
             except Exception as e:
                 logger.exception("文件下载/解密失败: %s", e)
-                reply = format_error("文件下载或解密失败", str(e))
+                # ValueError 是自定义的中文可读原因；其他异常（httpx 等）含内部 URL，不外发
+                detail = str(e) if isinstance(e, ValueError) else "请重新发送文件。"
+                reply = format_error("文件下载或解密失败", detail)
 
     # ---- Case 1.6: Voice message (text transcription passthrough) ----
     elif has_voice:
@@ -526,13 +615,20 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
         # Slash command interception
         if text.startswith("/"):
             logger.info("Slash command from=%s: %.200s", from_user, text)
-            reply = await _handle_slash(text, from_user)
-            if reply is None:
+            handled = await _handle_slash(client, text, from_user, context_token)
+            if handled is _HANDLED:
+                return
+            if handled is None:
                 # D class: passthrough — run CLI normally
                 result = await gate_and_run(client, from_user, context_token, text)
                 if result is None:
                     return
                 reply, artifacts = result
+            elif isinstance(handled, tuple):
+                # /agent 等元指令经确认门后的执行结果
+                reply, artifacts = handled
+            else:
+                reply = handled
         else:
             result = await gate_and_run(client, from_user, context_token, text)
             if result is None:
@@ -542,7 +638,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
     # ---- Send reply via iLink ----
     success = await client.send_message(
         to_user_id=from_user,
-        text=reply,
+        text=cancelled_notice + reply,
         context_token=context_token,
         baseurl=client.state.baseurl,
         bot_token=client.state.bot_token,
@@ -594,7 +690,8 @@ async def periodic_clean_scratch():
     while True:
         try:
             await asyncio.sleep(3600)
-            clean_scratch()
+            # 同步文件遍历放到线程池，避免阻塞事件循环卡死长轮询心跳
+            await asyncio.to_thread(clean_scratch)
         except Exception as e:
             logger.exception("periodic_clean_scratch error: %s", e)
 
@@ -602,17 +699,26 @@ async def periodic_clean_scratch():
 async def main_loop() -> None:
     """Main daemon loop: manages state, QR login, and message receiving."""
     ensure_runtime_dirs()
-    clean_scratch()
+    # 同步文件遍历放到线程池，避免阻塞事件循环
+    await asyncio.to_thread(clean_scratch)
     if config.update_check_enabled:
-        asyncio.create_task(update_check_loop())
-    asyncio.create_task(periodic_clean_scratch())
+        _spawn_bg(update_check_loop())
+    _spawn_bg(periodic_clean_scratch())
     while True:
         client = ILinkClient()
+        # 本轮 client 的在途消息任务（强引用持有，relogin 前排空，避免拿死连接发消息）
+        msg_tasks: set = set()
         try:
             state_loaded = client.state.load()
 
             if not state_loaded or not client.state.bot_token:
-                success = await login_flow(client)
+                try:
+                    success = await login_flow(client)
+                except Exception as e:
+                    # 网络抖动/服务端异常不应直接杀死 daemon
+                    logger.exception("登录流程异常，5 秒后重试: %s", e)
+                    await asyncio.sleep(5)
+                    continue
                 if not success:
                     logger.warning("扫码超时，3 秒后重新获取二维码等待扫码")
                     await asyncio.sleep(3)
@@ -624,19 +730,22 @@ async def main_loop() -> None:
 
             # Inner loop: long-poll for messages
             get_updates_buf = ""
+            fail_delay = 0.5  # 网络异常指数退避，封顶 30s
             while True:
                 try:
                     msgs, new_buf = await client.get_updates(
                         get_updates_buf, baseurl, bot_token
                     )
+                    fail_delay = 0.5  # 成功一次即重置退避
                 except Exception as e:
                     # Token invalidated (401/403) → break for re-login
                     logger.exception("长轮询异常: %s", e)
                     if not client.state.bot_token:
                         logger.warning("Bot token 已失效，准备重新登录")
                         break
-                    # Network hiccup → short delay and retry
-                    await asyncio.sleep(0.5)
+                    # Network hiccup → 指数退避后重试
+                    await asyncio.sleep(fail_delay)
+                    fail_delay = min(fail_delay * 2, 30.0)
                     continue
 
                 # Always update cursor with the server-returned value
@@ -645,8 +754,14 @@ async def main_loop() -> None:
                 for msg in msgs:
                     msg_type = msg.get("message_type", 0)
                     if msg_type == 1:  # User message
+                        if _is_duplicate_msg(msg):
+                            logger.info("跳过重复投递的消息: %s", _msg_dedup_key(msg))
+                            continue
+                        logger.debug("inbound msg keys: %s", sorted(msg.keys()))
                         # Non-blocking async task creation: process message in background
-                        asyncio.create_task(_safe_process_message(client, msg))
+                        t = asyncio.create_task(_safe_process_message(client, msg))
+                        msg_tasks.add(t)
+                        t.add_done_callback(msg_tasks.discard)
                     else:
                         logger.debug(
                             "跳过 message_type=%s", msg_type
@@ -659,6 +774,19 @@ async def main_loop() -> None:
             logger.info("收到退出信号")
             raise
         finally:
+            # 先排空/取消在途消息任务，再关连接，避免任务拿死 client 静默失败
+            if msg_tasks:
+                snapshot = set(msg_tasks)
+                logger.info(
+                    "等待 %d 个在途消息任务完成（最长 %.0fs）...",
+                    len(snapshot), _DRAIN_TIMEOUT_S,
+                )
+                _, still_pending = await asyncio.wait(snapshot, timeout=_DRAIN_TIMEOUT_S)
+                if still_pending:
+                    logger.warning("强制取消 %d 个未完成的在途任务", len(still_pending))
+                    for t in still_pending:
+                        t.cancel()
+                    await asyncio.gather(*still_pending, return_exceptions=True)
             await client.close()
 
         # Decide whether to re-login or exit

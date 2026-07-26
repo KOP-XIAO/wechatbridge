@@ -23,6 +23,9 @@ from .runner_common import (
 
 logger = logging.getLogger("grok_runner")
 
+# execve 单参数上限（Linux MAX_ARG_STRLEN = 128KB），留安全余量
+_MAX_ARG_BYTES = 120 * 1024
+
 
 # ---------------------------------------------------------------------------
 # Per-user .grok directory setup
@@ -250,12 +253,15 @@ def _build_grok_command(prompt: str, prefs: dict, first: bool, persona_content: 
 # Artifact extraction from chat_history.jsonl
 # ---------------------------------------------------------------------------
 
-def _extract_grok_artifacts(session_dir: str, session_id: str) -> list:
+def _extract_grok_artifacts(session_dir: str, session_id: str, since: float = 0.0) -> list:
     """Extract (name, abs_path) tuples from grok session chat_history.jsonl.
 
     grok stores sessions under $HOME/.grok/sessions/<url-encoded-cwd>/<session-id>/.
     The chat_history.jsonl contains structured tool_calls with file_path arguments
     from write/edit operations.
+
+    ``since``: 只收录 mtime >= since 的文件——chat_history.jsonl 跨轮累积，
+    不过滤的话 --continue 会话每轮都会把历史文件重发一遍。
 
     Falls back to empty list on any error (never blocks text reply).
     """
@@ -292,6 +298,12 @@ def _extract_grok_artifacts(session_dir: str, session_id: str) -> list:
                         if name in ("write", "edit", "str_replace") and isinstance(args, dict):
                             fp = args.get("file_path", "")
                             if fp and os.path.isabs(fp):
+                                # 只收录本轮运行期间新写/修改的文件
+                                try:
+                                    if since and os.path.getmtime(fp) < since - 2.0:
+                                        continue
+                                except OSError:
+                                    continue  # 文件已不存在，无需回传
                                 art_name = os.path.basename(fp)
                                 key = (art_name, fp)
                                 if key not in seen:
@@ -305,7 +317,7 @@ def _extract_grok_artifacts(session_dir: str, session_id: str) -> list:
     return artifacts
 
 
-def _parse_grok_output(stdout_text: str, session_dir: str) -> tuple:
+def _parse_grok_output(stdout_text: str, session_dir: str, since: float = 0.0) -> tuple:
     """Parse grok JSON output into (display_text, artifacts).
 
     Handles both success JSON ({text, sessionId, ...}) and error JSON
@@ -330,7 +342,7 @@ def _parse_grok_output(stdout_text: str, session_dir: str) -> tuple:
 
     artifacts = []
     if session_id:
-        artifacts = _extract_grok_artifacts(session_dir, session_id)
+        artifacts = _extract_grok_artifacts(session_dir, session_id, since=since)
 
     # Strip file:/// links from display (in case grok emits them)
     display = re.sub(
@@ -354,6 +366,14 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
     """
     if timeout is None:
         timeout = config.agy_timeout
+
+    # argv 单参数上限约 128KB（MAX_ARG_STRLEN），超长 prompt 直接拒绝，避免 E2BIG
+    if len(prompt.encode("utf-8", errors="replace")) > _MAX_ARG_BYTES:
+        logger.warning("Prompt too large for argv from user %s", user_id)
+        return format_error(
+            "消息过长",
+            f"单条消息超过 {_MAX_ARG_BYTES // 1024}KB 无法传给 CLI，请精简或分段发送。",
+        ), []
 
     t0 = time.time()
     session_dir = ensure_user_grok(user_id)
@@ -398,22 +418,22 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
 
-        display, artifacts = _parse_grok_output(stdout_text, session_dir)
+        display, artifacts = _parse_grok_output(stdout_text, session_dir, since=t0)
 
-        # Failure detection: non-zero exit, or structured error already formatted
+        # Failure detection: 非零退出一律视为失败（与 agy 行为对齐），
+        # 零退出但 stdout 是结构化错误（已格式化为 ❌ 前缀）也算失败
         failed = process.returncode != 0 or (
             isinstance(display, str) and display.startswith("❌")
         )
-        if process.returncode != 0 and (not display or display == EMPTY_REPLY):
+        if process.returncode != 0:
             logger.warning(
                 "grok exited with code %s for user %s: %.200s",
                 process.returncode, user_id, stderr_text,
             )
-            display = format_cli_error(
-                stderr_text or "grok 进程异常退出", backend="grok"
-            )
             artifacts = []
-            failed = True
+            if not (isinstance(display, str) and display.startswith("❌")):
+                raw_err = stderr_text or ("" if display == EMPTY_REPLY else display) or "grok 进程异常退出"
+                display = format_cli_error(raw_err, backend="grok")
 
         # Only mark session initialized on a real successful reply
         if first and not failed:
@@ -431,10 +451,15 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
         await terminate_process(process, graceful=True)
         return format_error("处理超时", f"超过 {timeout} 秒未完成，已终止本次任务。"), []
 
+    except asyncio.CancelledError:
+        # 任务被取消（如重登录前排空）：必须杀掉子进程再传递取消
+        await terminate_process(process, graceful=False)
+        raise
+
     except Exception as e:
         logger.exception("Unexpected error running grok: %s", e)
         await terminate_process(process, graceful=False)
-        return format_error("执行出错", str(e)), []
+        return format_error("执行出错", "内部错误，详情见服务端日志。"), []
 
 
 async def _run_grok_subcommand(subcmd_args: list, user_id: str) -> str:
@@ -445,6 +470,7 @@ async def _run_grok_subcommand(subcmd_args: list, user_id: str) -> str:
     """
     session_dir = ensure_user_grok(user_id)
     cmd = [config.grok_binary_path] + subcmd_args
+    process = None
     try:
         env = sanitize_env(session_dir)
         process = await asyncio.create_subprocess_exec(
@@ -476,10 +502,16 @@ async def _run_grok_subcommand(subcmd_args: list, user_id: str) -> str:
         return clean_output(stdout_text) or EMPTY_REPLY
 
     except asyncio.TimeoutError:
+        # 超时必须回收子进程，否则挂死的子命令成为孤儿进程
+        await terminate_process(process, graceful=True)
         return format_error("指令超时", "子命令 30 秒内未完成。")
+    except asyncio.CancelledError:
+        await terminate_process(process, graceful=False)
+        raise
     except Exception as e:
         logger.exception("Subcommand error: %s", e)
-        return format_error("执行出错", str(e))
+        await terminate_process(process, graceful=False)
+        return format_error("执行出错", "内部错误，详情见服务端日志。")
 
 
 # ---------------------------------------------------------------------------
@@ -665,18 +697,7 @@ async def handle_grok_slash_command(text: str, user_id: str) -> str | None:
             "> 用 codegraph 的 search 工具搜 ctxmode"
         )
 
-    if cmd == "/agent":
-        if not config.enable_subagent:
-            return "ℹ️ **该功能已禁用** ℹ️"
-        if not args:
-            return "❌ **缺少参数** ❌\n\n`/agent <名称> <任务>`"
-        agent_parts = args.split(maxsplit=1)
-        agent_name = agent_parts[0]
-        agent_task = agent_parts[1] if len(agent_parts) > 1 else ""
-        crafted = f"请用 invoke_subagent 调用 agent {agent_name} 执行任务：{agent_task}"
-        logger.info("Agent subcmd: user=%s agent=%s task=%.100s", user_id, agent_name, agent_task)
-        result_text, _ = await run_grok(crafted, user_id)
-        return result_text
+    # /agent 已上移到 main.py 统一处理（必须经过危险确认门，不能再绕过）
 
     # --- D class: passthrough to grok (return None so caller runs run_grok) ---
     return None

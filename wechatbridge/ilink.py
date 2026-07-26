@@ -209,9 +209,12 @@ class ILinkState:
                     os.chmod(parent, 0o700)
                 except OSError:
                     pass
-            with open(self.path, "w") as f:
+            # tmp + os.replace 原子写，避免崩溃留下半截 state 文件
+            tmp_path = self.path + ".tmp"
+            with open(tmp_path, "w") as f:
                 json.dump(data, f)
-            os.chmod(self.path, 0o600)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, self.path)
         except OSError as e:
             logger.error("Failed to save iLink state: %s", e)
 
@@ -270,7 +273,7 @@ class ILinkClient:
         return qrcode_str, qrcode_img_content
 
     async def poll_qrcode_status(
-        self, qrcode_str: str, timeout: int = 180, interval: float = 1.5
+        self, qrcode_str: str, timeout: int = 180
     ) -> Tuple[str, str]:
         """
         Poll QR code status until confirmed or timeout.
@@ -369,11 +372,12 @@ class ILinkClient:
             logger.warning("HTTP error in get_updates: %s", e)
             return [], buf
         except httpx.RequestError as e:
+            # 网络层错误上抛，由主循环做指数退避（避免原地满速重试+日志洪泛）
             logger.warning("Network error in get_updates: %s", e)
-            return [], buf
+            raise
         except Exception as e:
             logger.exception("Unexpected error in get_updates: %s", e)
-            return [], buf
+            raise
 
     # ---- Media upload and sending ----
 
@@ -457,8 +461,8 @@ class ILinkClient:
                 )
             elapsed = time.time() - t0
             logger.info(
-                "CDN upload done: %d bytes in %.3fs x-encrypted-param=%.80s",
-                len(ciphertext), elapsed, encrypted_param,
+                "CDN upload done: %d bytes in %.3fs x-encrypted-param(len=%d)",
+                len(ciphertext), elapsed, len(encrypted_param),
             )
             return encrypted_param
         except httpx.TimeoutException:
@@ -826,13 +830,13 @@ class ILinkClient:
             cl = resp.headers.get("content-length")
             if cl is not None:
                 try:
-                    if int(cl) > max_in:
-                        raise ValueError(
-                            f"入站文件过大（Content-Length {cl} > {max_in} 字节）"
-                        )
-                except ValueError as e:
-                    if "入站文件过大" in str(e):
-                        raise
+                    declared = int(cl)
+                except ValueError:
+                    declared = None  # 非法 Content-Length 头忽略，由流式上限兜底
+                if declared is not None and declared > max_in:
+                    raise ValueError(
+                        f"入站文件过大（Content-Length {cl} > {max_in} 字节）"
+                    )
             async for piece in resp.aiter_bytes():
                 if not piece:
                     continue

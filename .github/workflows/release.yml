@@ -15,9 +15,10 @@ jobs:
     environment: pypi
 
     steps:
-      - uses: actions/checkout@v4
+      # 所有第三方 action 固定到 commit SHA，防浮动标签供应链投毒
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -37,14 +38,18 @@ jobs:
           python -m build
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@2834a314042ef964da07689278dd1e9d773e8afd # v1.14.1
 
       - name: Extract release notes
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           awk "/^## \[$VERSION\]/ {flag=1; next} /^## \[/ {flag=0} flag" CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "ERROR: CHANGELOG.md 中未找到 [$VERSION] 段，拒绝发布空 Release Notes"
+            exit 1
+          fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           body_path: release_notes.md

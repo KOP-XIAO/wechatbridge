@@ -71,22 +71,18 @@ if command -v systemctl &>/dev/null; then
         echo "Restarting service '$WECHATBRIDGE_SERVICE'..."
         $SUDO_CMD systemctl restart "$WECHATBRIDGE_SERVICE" || echo "  (service not found, skipping)"
     else
-        # Restart the main service if it exists
-        if $SUDO_CMD systemctl list-unit-files wechatbridge.service &>/dev/null; then
-            echo "Restarting wechatbridge.service..."
-            $SUDO_CMD systemctl restart wechatbridge.service || echo "  (not found, skipping)"
-        fi
-
-        # Restart all enabled or active template instances
-        echo "Looking for wechatbridge@*.service instances..."
-        mapfile -t INSTANCES < <($SUDO_CMD systemctl list-units --all 'wechatbridge@*.service' --no-legend 2>/dev/null | awk '{print $1}' | sort -u || true)
-        if [ ${#INSTANCES[@]} -gt 0 ]; then
-            for svc in "${INSTANCES[@]}"; do
+        # Restart every wechatbridge unit that exists (plain service, template
+        # instances wechatbridge@*.service, and legacy names like
+        # wechatbridge2.service) — enumerate loaded units instead of guessing.
+        echo "Looking for wechatbridge*.service units..."
+        mapfile -t UNITS < <($SUDO_CMD systemctl list-units --all 'wechatbridge*.service' --no-legend 2>/dev/null | awk '{print $1}' | sort -u || true)
+        if [ ${#UNITS[@]} -gt 0 ]; then
+            for svc in "${UNITS[@]}"; do
                 echo "Restarting $svc..."
                 $SUDO_CMD systemctl restart "$svc" || echo "  (failed to restart $svc)"
             done
         else
-            echo "  No wechatbridge@*.service instances found."
+            echo "  No wechatbridge*.service units found."
         fi
     fi
 else

@@ -23,6 +23,9 @@ from .runner_common import (
 
 logger = logging.getLogger("agy_runner")
 
+# execve 单参数上限（Linux MAX_ARG_STRLEN = 128KB），留安全余量
+_MAX_ARG_BYTES = 120 * 1024
+
 
 def extract_artifacts(text: str) -> list[tuple[str, str]]:
     """Extract (name, absolute_path) tuples from markdown file:/// links.
@@ -108,6 +111,14 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
     """
     if timeout is None:
         timeout = config.agy_timeout
+
+    # argv 单参数上限约 128KB（MAX_ARG_STRLEN），超长 prompt 直接拒绝，避免 E2BIG
+    if len(prompt.encode("utf-8", errors="replace")) > _MAX_ARG_BYTES:
+        logger.warning("Prompt too large for argv from user %s", user_id)
+        return format_error(
+            "消息过长",
+            f"单条消息超过 {_MAX_ARG_BYTES // 1024}KB 无法传给 CLI，请精简或分段发送。",
+        ), []
 
     t0 = time.time()
     session_dir = ensure_user_gemini(user_id)
@@ -228,10 +239,25 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                         env=env,
                         preexec_fn=os.setsid if hasattr(os, "setsid") else None,
                     )
-                    r_stdout, r_stderr = await asyncio.wait_for(
-                        retry_process.communicate(),
-                        timeout=float(timeout),
-                    )
+                    try:
+                        r_stdout, r_stderr = await asyncio.wait_for(
+                            retry_process.communicate(),
+                            timeout=float(timeout),
+                        )
+                    except asyncio.TimeoutError:
+                        # 重试进程也必须回收，否则超时后成为孤儿进程
+                        logger.warning(
+                            "agy retry timed out after %ss for user %s, terminating retry process",
+                            timeout, user_id,
+                        )
+                        await terminate_process(retry_process, graceful=True)
+                        return format_error(
+                            "级联超时",
+                            "模型 API 级联推理超时，自动重试仍超时。请稍后重试或简化指令。",
+                        ), []
+                    except (asyncio.CancelledError, Exception):
+                        await terminate_process(retry_process, graceful=False)
+                        raise
                     r_stdout_text = r_stdout.decode("utf-8", errors="replace").strip()
                     r_stderr_text = r_stderr.decode("utf-8", errors="replace").strip()
                     # Any useful stdout after retry counts as recovered (agy may exit non-zero)
@@ -271,10 +297,15 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         await terminate_process(process, graceful=True)
         return format_error("处理超时", f"超过 {timeout} 秒未完成，已终止本次任务。"), []
 
+    except asyncio.CancelledError:
+        # 任务被取消（如重登录前排空）：必须杀掉子进程再传递取消
+        await terminate_process(process, graceful=False)
+        raise
+
     except Exception as e:
         logger.exception("Unexpected error running agy: %s", e)
         await terminate_process(process, graceful=False)
-        return format_error("执行出错", str(e)), []
+        return format_error("执行出错", "内部错误，详情见服务端日志。"), []
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +321,7 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
     """
     session_dir = ensure_user_gemini(user_id)
     cmd = [config.agy_binary_path] + subcmd_args
+    process = None
     try:
         env = sanitize_env(session_dir)
         process = await asyncio.create_subprocess_exec(
@@ -320,10 +352,16 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
         return clean_output(stdout_text) or EMPTY_REPLY
 
     except asyncio.TimeoutError:
+        # 超时必须回收子进程，否则挂死的子命令成为孤儿进程
+        await terminate_process(process, graceful=True)
         return format_error("指令超时", "子命令 30 秒内未完成。")
+    except asyncio.CancelledError:
+        await terminate_process(process, graceful=False)
+        raise
     except Exception as e:
         logger.exception("Subcommand error: %s", e)
-        return format_error("执行出错", str(e))
+        await terminate_process(process, graceful=False)
+        return format_error("执行出错", "内部错误，详情见服务端日志。")
 
 
 def _cmd_help() -> str:
@@ -612,19 +650,7 @@ async def handle_slash_command(text: str, user_id: str) -> str | None:
             "> 用 codegraph 的 search 工具搜 ctxmode"
         )
 
-    if cmd == "/agent":
-        if not config.enable_subagent:
-            return "ℹ️ **该功能已禁用** ℹ️"
-        if not args:
-            return "❌ **缺少参数** ❌\n\n`/agent <名称> <任务>`"
-        # Construct prompt and run through agy
-        agent_parts = args.split(maxsplit=1)
-        agent_name = agent_parts[0]
-        agent_task = agent_parts[1] if len(agent_parts) > 1 else ""
-        crafted = f"请用 invoke_subagent 调用 agent {agent_name} 执行任务：{agent_task}"
-        logger.info("Agent subcmd: user=%s agent=%s task=%.100s", user_id, agent_name, agent_task)
-        result_text, _ = await run_agy(crafted, user_id)
-        return result_text
+    # /agent 已上移到 main.py 统一处理（必须经过危险确认门，不能再绕过）
 
     # --- D class: passthrough to agy (return None so caller runs run_agy) ---
     return None

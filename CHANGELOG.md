@@ -5,6 +5,34 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-07-26
+
+### Fixed
+
+- **`/agent` bypassed the dangerous-prompt confirm gate**: backend handlers invoked the CLI directly without `is_dangerous` checking. The command is now handled centrally in `main.py` and always routed through `gate_and_run`.
+- **Orphaned subprocesses**: agy's cascade-timeout retry process was never terminated when the retry itself timed out; agy/grok subcommands (`/models`, `/agents`) also leaked their child process on the 30s timeout. All timeout/cancel/error paths now terminate the process group; `CancelledError` during shutdown kills the child before propagating.
+- **Re-login raced in-flight message handlers**: `client.close()` ran while background tasks still used the connection, so replies silently failed after retry loops. In-flight tasks are now drained (up to 90s) or cancelled before the client closes, and all `create_task` calls hold strong references to prevent premature GC.
+- **No backoff on long-poll network errors**: `get_updates` swallowed `RequestError` and returned empty results, making the main loop retry at full speed with log flooding. Network errors now propagate and the main loop backs off exponentially (0.5s → 30s cap).
+- **Login-flow network errors killed the daemon** (only systemd `Restart=always` saved it). Errors are now caught and retried after 5s.
+- **grok re-sent every historical artifact each turn**: `--continue` sessions accumulate `chat_history.jsonl`, and all past write/edit paths were re-collected every message. Only files modified during the current run are returned now.
+- **grok treated non-zero exits with JSON stdout as normal replies**; aligned with agy — non-zero exit is always a failure.
+- **`clean_scratch()` blocked the event loop** (sync file-tree walk in async context); now runs in a thread.
+- **Voice/image/file messages could not confirm dangerous prompts**, and media sent while a confirmation was pending was silently dropped. Voice transcriptions can now reply with the confirm token; media cancels the pending confirmation and is processed normally with a notice.
+- **Stale pending confirmation could be re-triggered** when the confirmed run raised before the entry was deleted; the entry is now removed before execution.
+- **No inbound message dedup**: server redelivery or restart replay ran the LLM twice. Best-effort LRU dedup keyed on `message_id`/`client_id`-style fields (no-op when the server sends no id).
+- **Internal exception text leaked to WeChat users** (server paths, internal URLs). Generic agy/grok errors now return a fixed message; media download errors only pass through crafted `ValueError` reasons.
+- **`clean_output` corrupted code output**: the HTML-tag regex stripped generics like `List<String>`. Now a whitelist of real HTML tags.
+- **Non-atomic state/prefs writes** could leave half-written JSON on crash; both now write tmp + `os.replace`.
+- Removed dead `interval` parameter from `poll_qrcode_status`; rewrote the fragile string-matching Content-Length check in media download.
+- **Sensitive-env sanitizer gaps**: added `PASS`/`PWD`/`AUTH`/`CRED`/`CREDS`/`PRIVATE` segments so names like `DB_PASS` or `ANTHROPIC_AUTH` are stripped from child environments.
+- **Oversized prompts crashed with E2BIG**: prompts over 120KB are rejected up front with a clear message.
+- CDN upload log no longer prints the `x-encrypted-param` value (it authorizes media download); only its length is logged.
+
+### Changed
+
+- **Deployment is pipx-only**: running from the source checkout (`python -m wechatbridge` + `WorkingDirectory`) is deprecated. `deploy/update.sh` now enumerates all `wechatbridge*.service` units for restart (covers template instances and legacy names; removes the always-true `list-unit-files` check).
+- **Release workflow hardening**: all third-party actions pinned to commit SHAs (checkout v6.0.3, setup-python v7.0.0, gh-action-pypi-publish v1.14.1, action-gh-release v2.6.2); the workflow now fails instead of publishing an empty GitHub Release when the CHANGELOG section for the tag is missing.
+
 ## [1.3.1] - 2026-07-26
 
 ### Fixed

@@ -22,8 +22,11 @@ logger = logging.getLogger("wechatbridge.runner")
 
 # ANSI escape code pattern
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
-# HTML tag pattern
-HTML_TAG_RE = re.compile(r"<[^>]+>")
+# HTML tag pattern — 白名单制，避免把代码输出里的 <String>、<T> 等泛型当标签误删
+HTML_TAG_RE = re.compile(
+    r"</?(?:b|i|em|strong|code|pre|a|br|div|span|p|u|s|ul|ol|li|table|thead|tbody|tr|td|th|h[1-6]|blockquote|font|center|hr)(?:\s[^<>]*)?/?>",
+    re.IGNORECASE,
+)
 
 # Sensitive env var prefixes to strip from child process environments
 _SENSITIVE_PREFIXES = (
@@ -32,7 +35,8 @@ _SENSITIVE_PREFIXES = (
 )
 # Segment names that mark a var as secret when they appear as a path part
 _SENSITIVE_SEGMENTS = frozenset({
-    "TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD",
+    "TOKEN", "KEY", "SECRET", "PASSWORD", "PASSWD", "PASS", "PWD",
+    "AUTH", "CRED", "CREDS", "PRIVATE",
     "CREDENTIAL", "CREDENTIALS", "APIKEY", "API_KEY",
 })
 _SENSITIVE_SUFFIXES = (
@@ -482,8 +486,11 @@ def save_prefs(user_id: str, prefs: dict) -> None:
                 payload["by_backend"].setdefault(b, _empty_backend_slot())
         # Current backend slot always mirrors active model/effort/mode
         sync_active_to_memory(payload)
-        with open(prefs_path, "w") as f:
+        # tmp + os.replace 原子写，避免崩溃留下半截 prefs.json
+        tmp_path = prefs_path + ".tmp"
+        with open(tmp_path, "w") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, prefs_path)
         # Keep caller's dict in sync with what was written
         prefs.update(payload)
     except OSError as e:
