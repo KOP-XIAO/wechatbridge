@@ -68,17 +68,37 @@ _seen_msg_ids: "OrderedDict[str, None]" = OrderedDict()
 _SEEN_MSG_IDS_CAP = 1000
 
 
+# 去重键字段优先级，对齐官方 WeixinMessage schema（Tencent/openclaw-weixin types.ts）：
+#   message_id(数值) > client_id > item_list[0].msg_id > seq
 def _msg_dedup_key(msg: dict) -> str | None:
     """从入站消息提取去重键；服务端不下发任何 id 字段时返回 None（无法安全去重）。"""
-    for field in ("message_id", "msg_id", "client_id", "new_msg_id", "seq"):
+    for field in ("message_id", "client_id"):
         v = msg.get(field)
         if v:
             return f"{field}:{v}"
+    items = msg.get("item_list")
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        v = items[0].get("msg_id")
+        if v:
+            return f"item_msg_id:{v}"
+    v = msg.get("seq")
+    if v:
+        return f"seq:{v}"
     return None
 
 
+_dedup_field_announced = False
+
+
 def _is_duplicate_msg(msg: dict) -> bool:
+    global _dedup_field_announced
     key = _msg_dedup_key(msg)
+    if not _dedup_field_announced:
+        _dedup_field_announced = True
+        if key:
+            logger.info("消息去重已启用，使用字段: %s", key.split(":", 1)[0])
+        else:
+            logger.info("服务端未下发消息 id 字段，去重停用（依赖服务端游标）")
     if key is None:
         return False
     if key in _seen_msg_ids:

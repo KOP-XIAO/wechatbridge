@@ -19,7 +19,8 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - **`clean_scratch()` blocked the event loop** (sync file-tree walk in async context); now runs in a thread.
 - **Voice/image/file messages could not confirm dangerous prompts**, and media sent while a confirmation was pending was silently dropped. Voice transcriptions can now reply with the confirm token; media cancels the pending confirmation and is processed normally with a notice.
 - **Stale pending confirmation could be re-triggered** when the confirmed run raised before the entry was deleted; the entry is now removed before execution.
-- **No inbound message dedup**: server redelivery or restart replay ran the LLM twice. Best-effort LRU dedup keyed on `message_id`/`client_id`-style fields (no-op when the server sends no id).
+- **No inbound message dedup**: server redelivery or restart replay ran the LLM twice. Best-effort LRU dedup aligned with the official `WeixinMessage` schema (`message_id` → `client_id` → per-item `msg_id` → `seq`; no-op when the server sends none), with a one-time INFO log naming the active field.
+- **Session cleanup choked on dangling symlinks** (e.g. stale venv `bin/python` links in scratch): `os.path.getmtime` followed the link and raised on every hourly run, spamming warnings and never expiring the link. Cleanup now uses `lstat` so dangling links age out by their own mtime.
 - **Internal exception text leaked to WeChat users** (server paths, internal URLs). Generic agy/grok errors now return a fixed message; media download errors only pass through crafted `ValueError` reasons.
 - **`clean_output` corrupted code output**: the HTML-tag regex stripped generics like `List<String>`. Now a whitelist of real HTML tags.
 - **Non-atomic state/prefs writes** could leave half-written JSON on crash; both now write tmp + `os.replace`.

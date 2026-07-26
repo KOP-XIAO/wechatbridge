@@ -632,7 +632,9 @@ def _remove_old_files_under(root: str, cutoff: float) -> int:
                 try:
                     if not os.path.isfile(path) and not os.path.islink(path):
                         continue
-                    if os.path.getmtime(path) < cutoff:
+                    # lstat 不跟随符号链接：悬空链接（如旧 venv 的 bin/python）
+                    # 也能按链接自身 mtime 正常过期，不再每次刷 warning
+                    if os.lstat(path).st_mtime < cutoff:
                         os.remove(path)
                         removed += 1
                         logger.info("Session cleanup: removed %s", path)
