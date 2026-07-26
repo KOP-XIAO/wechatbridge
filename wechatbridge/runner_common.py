@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import sys
 import time
 
@@ -167,6 +168,19 @@ def format_error(title: str, detail: str = "") -> str:
     if detail:
         return f"❌ **{title}** ❌\n\n{detail}"
     return f"❌ **{title}** ❌"
+
+
+def format_oversized_artifact_notice(art_name: str, size_mb: float) -> str:
+    """User-facing text when an artifact is too large to send back to WeChat.
+
+    Must never include server absolute paths — only the display name and size.
+    """
+    name = (art_name or "file").replace("`", "'").strip() or "file"
+    return (
+        f"⚠️ **文件过大** ⚠️\n\n"
+        f"`{name}` {float(size_mb):.1f} MB\n"
+        f"已保存在服务器会话目录，未回传微信。"
+    )
 
 
 def format_cli_error(raw_message: str, *, backend: str = "") -> str:
@@ -616,34 +630,91 @@ _SESSION_HISTORY_REL_DIRS = (
 _SQLITE_SIDECAR_TAILS = ("-wal", "-shm", "-journal")
 
 
+def _is_dangling_symlink(path: str) -> bool:
+    """True if path is a symlink whose target does not resolve.
+
+    Uses ``lstat`` first so we never mistake a plain missing path for a link.
+    ``os.path.exists`` follows the final hop — False means dangling. Unlink
+    still tolerates races (ENOENT) in the caller.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISLNK(st.st_mode):
+        return False
+    try:
+        return not os.path.exists(path)
+    except OSError:
+        return True
+
+
+def _unlink_quiet(path: str) -> bool:
+    """Unlink path; True if removed. ENOENT (race) counts as already gone."""
+    try:
+        os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        logger.warning("Session cleanup failed %s: %s", path, e)
+        return False
+
+
 def _remove_old_files_under(root: str, cutoff: float) -> int:
     """Delete files under root older than cutoff; prune empty subdirs.
 
     For independent temp files only (images/cache/scratch). Does not remove
     ``root`` itself. Returns number of files removed.
+
+    Dangling symlinks (file or dir links, e.g. stale venv ``bin/python`` /
+    ``lib64``) are removed immediately — they are never useful and previously
+    caused getmtime noise. Intact files/links still age out by ``lstat`` mtime.
     """
     if not os.path.isdir(root):
         return 0
     removed = 0
     try:
-        for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        # followlinks=False: never walk through session symlinks into host trees
+        for dirpath, dirnames, filenames in os.walk(
+            root, topdown=False, followlinks=False
+        ):
+            # Dir symlinks (and some platforms' file links) may appear in dirnames
+            for dn in list(dirnames):
+                dpath = os.path.join(dirpath, dn)
+                if _is_dangling_symlink(dpath):
+                    if _unlink_quiet(dpath):
+                        removed += 1
+                        logger.info(
+                            "Session cleanup: removed dangling dir link %s", dpath
+                        )
             for fn in filenames:
                 path = os.path.join(dirpath, fn)
                 try:
-                    if not os.path.isfile(path) and not os.path.islink(path):
+                    if os.path.islink(path):
+                        # 悬空链接立刻删；完好链接仍按自身 mtime 过期
+                        if _is_dangling_symlink(path) or os.lstat(path).st_mtime < cutoff:
+                            if _unlink_quiet(path):
+                                removed += 1
+                                logger.info("Session cleanup: removed %s", path)
                         continue
-                    # lstat 不跟随符号链接：悬空链接（如旧 venv 的 bin/python）
-                    # 也能按链接自身 mtime 正常过期，不再每次刷 warning
+                    if not os.path.isfile(path):
+                        continue
                     if os.lstat(path).st_mtime < cutoff:
                         os.remove(path)
                         removed += 1
                         logger.info("Session cleanup: removed %s", path)
+                except FileNotFoundError:
+                    # raced with another cleaner / process
+                    continue
                 except OSError as e:
                     logger.warning("Session cleanup failed %s: %s", path, e)
             if dirpath == root:
                 continue
             try:
-                if not os.listdir(dirpath):
+                # With followlinks=False, dirpath is a real dir we entered — only
+                # prune when empty (never follow/remove host trees via symlinks).
+                if not os.path.islink(dirpath) and not os.listdir(dirpath):
                     os.rmdir(dirpath)
             except OSError:
                 pass

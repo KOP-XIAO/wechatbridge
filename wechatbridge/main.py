@@ -22,6 +22,7 @@ from .runner_common import (
     clean_session_media,
     format_error,
     format_model_label,
+    format_oversized_artifact_notice,
     get_session_dir,
     is_dangerous,
     load_prefs,
@@ -380,9 +381,14 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
             file_size = os.path.getsize(art_path)
             if file_size > config.max_outbound_file_bytes:
                 size_mb = file_size / (1024 * 1024)
+                # Never echo server absolute paths to WeChat users
+                logger.info(
+                    "Artifact too large (%.1f MB), kept on server: %s",
+                    size_mb, art_path,
+                )
                 await client.send_message(
                     to_user_id=from_user,
-                    text=f"⚠️ **文件过大** ⚠️\n\n`{art_name}` {size_mb:.1f} MB\n已存：`{art_path}`",
+                    text=format_oversized_artifact_notice(art_name, size_mb),
                     context_token=context_token,
                     baseurl=client.state.baseurl,
                     bot_token=client.state.bot_token,

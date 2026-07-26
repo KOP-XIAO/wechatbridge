@@ -15,6 +15,9 @@ Environment=WECHATBRIDGE_INSTANCE=%i
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5s
+# Cap per-instance RSS so a single busy bot cannot OOM a small host
+MemoryAccounting=yes
+MemoryMax=300M
 # Create a dedicated system user if running under a non-root account
 User=wechatbridge
 

@@ -5,6 +5,22 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.3.3] - 2026-07-26
+
+### Fixed
+
+- **Dangling session symlinks**: cleanup now unlinks broken file/dir links immediately (not only after TTL), never follows symlinks while walking scratch trees, and treats unlink races (ENOENT) as success.
+- **iLink `ret=-1` + `message_id` log noise**: delivery decision centralized in `ilink_delivery_accepted`; non-zero ret with message_id is delivered at debug level, not warning.
+- **Oversized artifact replies leaked server absolute paths** to WeChat; user text goes through `format_oversized_artifact_notice` (name + size only).
+
+### Added
+
+- `tests/test_hardening.py` — real-path probes: split fidelity, path containment, dangling/outside-symlink cleanup, async `send_artifacts_back` / `_post_sendmessage_with_retry` mocks, env sanitizer (`python -m unittest`).
+
+### Changed
+
+- `deploy/wechatbridge@.service` recommends `MemoryMax=300M` (with accounting) so a single busy instance cannot OOM a small host.
+
 ## [1.3.2] - 2026-07-26
 
 ### Fixed

@@ -26,6 +26,22 @@ logger = logging.getLogger("ilink")
 ILINK_BASE = config.ilink_base_url.rstrip("/")
 
 
+def ilink_delivery_accepted(ret, message_id) -> bool:
+    """Whether an iLink sendmessage JSON body means the message was accepted.
+
+    The server often returns ``ret != 0`` (commonly ``-1``) **together with** a
+    non-empty ``message_id`` when delivery succeeded. Treat as failure only when
+    there is no message id to prove acceptance. ``ret == 0`` always accepts.
+    """
+    if ret == 0:
+        return True
+    if message_id is None:
+        return False
+    if isinstance(message_id, str):
+        return bool(message_id.strip())
+    return bool(message_id)
+
+
 def _is_allowed_media_url(url: str) -> bool:
     """Only allow downloads from WeChat CDN hosts or the configured CDN base host."""
     try:
@@ -633,7 +649,7 @@ class ILinkClient:
 
                 ret = data.get("ret", -1)
                 message_id = data.get("message_id", "")
-                if ret != 0 and not message_id:
+                if not ilink_delivery_accepted(ret, message_id):
                     logger.warning(
                         "%s failed ret=%s for %s (attempt %d/%d): %s",
                         log_label, ret, to_user_id, attempt, max_attempts, data,
@@ -644,14 +660,16 @@ class ILinkClient:
                         continue
                     return False
 
-                if ret != 0 and message_id:
-                    logger.warning(
-                        "%s ret=%s but has message_id=%s, treating as success",
+                if ret != 0:
+                    # Documented API quirk — delivered despite non-zero ret
+                    logger.debug(
+                        "%s ret=%s with message_id=%s (iLink quirk, delivered)",
                         log_label, ret, message_id,
                     )
                 logger.info(
-                    "%s sent to %s (attempt %d/%d): msg_id=%s",
-                    log_label, to_user_id, attempt, max_attempts, data.get("message_id"),
+                    "%s sent to %s (attempt %d/%d): msg_id=%s ret=%s",
+                    log_label, to_user_id, attempt, max_attempts,
+                    message_id, ret,
                 )
                 return True
 

@@ -1,2 +1,2 @@
 """WeChatBridge — bridge WeChat messages to agy or Grok Build CLIs."""
-__version__ = "1.3.2"
+__version__ = "1.3.3"
