@@ -5,9 +5,11 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-07-26
+
 ### Fixed
 
-- **CDN download allowlist now includes `wechat.com`**: international CDN domain `wechat.com` (e.g. `novac2c.cdn.wechat.com`) was missing from `_is_allowed_media_url()`, causing SSRF-protection false positives for users whose iLink server returns international media URLs.
+- **CDN download allowlist now includes `wechat.com`**: international CDN domain `wechat.com` (e.g. `novac2c.cdn.wechat.com`) was missing from `_is_allowed_media_url()`, causing SSRF-protection false positives ("拒绝非微信 CDN 下载地址") for users whose iLink server returns international media URLs. Any subdomain of `wechat.com` is accepted.
 - **Graceful fallback when full_url fails allowlist check**: `download_and_decrypt_media()` now logs a warning and falls back to the constructed CDN URL when `full_url` is rejected but `encrypt_query_param` is available, instead of raising a hard error. Fully blocked non-whitelist URLs without a fallback still raise `ValueError` with the rejected URL.
 
 ## [1.3.0] - 2026-07-26
