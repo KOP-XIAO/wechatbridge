@@ -4,13 +4,11 @@
 <dict>
     <key>Label</key>
     <string>com.wechatbridge</string>
-    <key>WorkingDirectory</key>
-    <string>/Users/YOUR_USER/wechatbridge</string>
+    <!-- pipx installs the entry point under ~/.local/bin — run `pipx install wechatbridge` first.
+         Config is read from ~/.config/wechatbridge/<instance>.env (see deploy/wechatbridge.env.example). -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>-m</string>
-        <string>wechatbridge</string>
+        <string>/Users/YOUR_USER/.local/bin/wechatbridge</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -23,7 +21,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+        <string>/Users/YOUR_USER/.local/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
     </dict>
 </dict>
 </plist>

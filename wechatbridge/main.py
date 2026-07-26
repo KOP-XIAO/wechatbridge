@@ -4,6 +4,7 @@ Active iLink client that receives WeChat messages and responds via CLI backends.
 Architecture: WeChat ClawBot(iLink) <-> wechatbridge(Python) <-> agy/grok CLI
 """
 
+import argparse
 import asyncio
 import base64
 import logging
@@ -13,6 +14,7 @@ import time
 import uuid
 from io import StringIO
 
+from . import __version__
 from .config import config, ensure_runtime_dirs
 from .ilink import ILinkClient
 from .runner_common import (
@@ -26,6 +28,7 @@ from .runner_common import (
     save_prefs,
     switch_backend_prefs,
 )
+from .update_check import update_check_loop, maybe_notify_admin, format_update_hint
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -74,6 +77,12 @@ async def _handle_slash(text: str, user_id: str) -> str | None:
     # /backend is a meta-command — switch CLI backend per user
     if cmd == "/backend":
         return _cmd_backend(args, user_id)
+
+    if cmd == "/version":
+        return (
+            f"📦 **版本信息** 📦\n\n当前版本: `{__version__}`\n"
+            f"实例: `{config.instance}`  后端: `{_get_backend(user_id)}`"
+        ) + format_update_hint()
 
     backend = _get_backend(user_id)
     if backend == "grok":
@@ -369,6 +378,9 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
         logger.warning("拒绝非白名单用户: %s", from_user)
         return
 
+    # ---- Admin notification (update available, etc.) ----
+    await maybe_notify_admin(client, from_user, context_token)
+
     # ---- Pending dangerous prompt confirmation ----
     pending = pending_confirms.get(from_user)
     if pending:
@@ -591,6 +603,8 @@ async def main_loop() -> None:
     """Main daemon loop: manages state, QR login, and message receiving."""
     ensure_runtime_dirs()
     clean_scratch()
+    if config.update_check_enabled:
+        asyncio.create_task(update_check_loop())
     asyncio.create_task(periodic_clean_scratch())
     while True:
         client = ILinkClient()
@@ -724,7 +738,10 @@ async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    logger.info("wechatbridge 启动 (backend=%s, instance=%s)", config.backend, config.instance)
+    parser = argparse.ArgumentParser(prog="wechatbridge", description="Bridge WeChat messages to agy or Grok Build CLIs — text/image/file/voice in, CLI replies and generated files back.")
+    parser.add_argument("--version", action="version", version=f"wechatbridge {__version__}")
+    parser.parse_args()
+    logger.info("wechatbridge v%s 启动 (backend=%s, instance=%s)", __version__, config.backend, config.instance)
     try:
         asyncio.run(main_loop())
     except KeyboardInterrupt:

@@ -54,23 +54,63 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 
 ## 安装
 
+推荐使用 [pipx](https://pypa.github.io/pipx/)（需要 Python >= 3.10）：
+
+```bash
+pipx install wechatbridge
+```
+
+安装后验证：
+
+```bash
+wechatbridge --version
+```
+
+### 安装 pipx
+
+**Debian / Ubuntu：**
+
+```bash
+sudo apt install pipx
+```
+
+**其他系统（或想装最新版）：**
+
+```bash
+python3 -m pip install --user pipx && python3 -m pipx ensurepath
+```
+
+然后重新打开终端或重新加载 shell 配置文件，确保 `pipx` 在 `PATH` 中。
+
+### 开发者
+
+如果你想从源码修改：
+
 ```bash
 git clone https://github.com/dorokuma/wechatbridge.git
 cd wechatbridge
-pip install -r requirements.txt
-```
-
-或装成本地包：
-
-```bash
 pip install -e .
 ```
 
 ## 配置
 
+配置加载优先级从高到低：
+
+1. `$WECHATBRIDGE_ENV_FILE` — 显式指定路径
+2. `$XDG_CONFIG_HOME/wechatbridge/<实例名>.env`（缺省 `~/.config/wechatbridge/<实例名>.env`）
+3. `$XDG_CONFIG_HOME/wechatbridge/.env`（缺省 `~/.config/wechatbridge/.env`）
+4. 仓库根目录 `.env` — **已废弃**（启动时会打印警告）
+
+实例名缺省为 `default`；可通过 `WECHATBRIDGE_INSTANCE` 修改。
+
+获取示例配置：
+
 ```bash
-cp deploy/wechatbridge.env.example .env
+mkdir -p ~/.config/wechatbridge
+curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/wechatbridge.env.example
 ```
+
+然后编辑 `~/.config/wechatbridge/.env` 修改你的配置。
 
 关键变量（都有默认值）：
 
@@ -88,28 +128,67 @@ cp deploy/wechatbridge.env.example .env
 | `WECHATBRIDGE_CONFIRM_TOKEN` | `y` | 危险闸门确认口令 |
 | `WECHATBRIDGE_ENABLE_MCP` | `true` | 是否启用 `/mcp` 说明指令 |
 | `WECHATBRIDGE_ENABLE_SUBAGENT` | `true` | 是否启用 `/agent` 提示改写指令 |
+| `WECHATBRIDGE_ADMINS` | _空_ | 逗号分隔的 wxid 列表；检测到新版本时管理员会收到微信通知 |
+| `WECHATBRIDGE_UPDATE_CHECK` | `true` | 启动时及每 24h 检查 PyPI 新版本；失败静默不影响运行 |
+| `WECHATBRIDGE_UPDATE_CHECK_INTERVAL` | `86400` | 版本检查间隔（秒） |
 
 完整列表见 [`deploy/wechatbridge.env.example`](deploy/wechatbridge.env.example)。
+
+> **为什么改配置位置？** pipx 全局安装后，源码目录下的 `.env` 不再合理。XDG 基础目录布局将配置与代码分离，并且天然支持多实例。
 
 ## 运行
 
 ```bash
-python -m wechatbridge
+wechatbridge
 ```
 
 首次运行会打印二维码（并在实例数据目录保存 PNG）。微信扫码绑定后开始收消息。
+
+## 升级
+
+```bash
+pipx upgrade wechatbridge
+sudo systemctl restart wechatbridge
+```
+
+或运行升级脚本（无需 clone 仓库，直接用 curl 获取）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/update.sh | sudo bash
+```
+
+脚本会自动升级 pipx 安装并重启服务。如果服务运行在专用系统用户下（如 `wechatbridge`），以 root 运行时会自动以该用户身份执行 pipx（可用 `WECHATBRIDGE_USER=<用户名>` 覆盖）。
+
+数据存放在 `~/.local/share/wechatbridge/<实例名>/`（会话、SQLite 历史、二维码、登录态），升级**不会**影响——你的 bot 保持登录，对话不丢失。
+
+升级 **major** 或 **minor** 版本（例如 1.2 → 1.3）前，请先查阅 [`CHANGELOG.md`](CHANGELOG.md) 中对应版本的破坏性变更和迁移步骤。
 
 ## 部署
 
 ### Linux（systemd）
 
+首先，在 `wechatbridge` 系统用户下安装：
+
+```bash
+sudo -u wechatbridge pipx install wechatbridge
+```
+
+然后部署服务 unit：
+
 ```bash
 sudo cp deploy/wechatbridge.service /etc/systemd/system/
-# 编辑 WorkingDirectory 和 User
 sudo systemctl enable --now wechatbridge
 ```
 
-**多实例**：每个 unit 设不同的 `WECHATBRIDGE_INSTANCE`。state、会话、二维码路径自动派生。
+**多实例：** 复制模板 `deploy/wechatbridge@.service` 并启动实例：
+
+```bash
+sudo cp deploy/wechatbridge@.service /etc/systemd/system/
+sudo systemctl enable --now wechatbridge@bot2
+sudo systemctl enable --now wechatbridge@bot3
+```
+
+每个实例读取自己的配置文件（`~/.config/wechatbridge/bot2.env`），数据存放在各自的数据目录（`~/.local/share/wechatbridge/bot2/`）。
 
 ### macOS（launchd）
 
@@ -137,6 +216,7 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 | `/add-dir <路径>` | **agy：** 校验通过后后续会带 `--add-dir`。**grok：** 只记偏好，暂不传给 CLI |
 | `/agents` | 通过当前 CLI 列 agent |
 | `/persona <内容>` | 设人格（`show` / `clear` / `reset`） |
+| `/version` | 显示当前版本、实例名和后端；若有新版本则显示升级提示 |
 | `/mcp` | 短 **使用说明** 文案（可用 `WECHATBRIDGE_ENABLE_MCP` 关掉） |
 | `/agent <名称> <任务>` | 拼成「调用子代理…」提示再跑 CLI（可用 `WECHATBRIDGE_ENABLE_SUBAGENT` 关掉） |
 

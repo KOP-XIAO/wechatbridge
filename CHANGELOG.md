@@ -5,12 +5,35 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-07-26
+
+### Added
+
+- **PyPI release workflow**: tag-triggered GitHub Actions workflow that validates tag-version consistency, builds, publishes to PyPI via trusted publishing, and auto-creates a GitHub Release from CHANGELOG.
+- **Built-in update check**: on startup and every 24 hours, silently checks PyPI for a newer version. New version is logged, reported to admin WeChat contacts (`WECHATBRIDGE_ADMINS`), and shown in `/version`.
+- `wechatbridge --version` CLI flag prints the current package version.
+- `~/.config/wechatbridge/<instance>.env` configuration location (XDG_CONFIG_HOME support). Priority: `$WECHATBRIDGE_ENV_FILE` > XDG instance file > XDG default file > repository `.env` (deprecated).
+- Deprecated environment variable auto-mapping via `config._DEPRECATED_ENV`.
+- `deploy/update.sh` — one-command upgrade script.
+- `deploy/wechatbridge@.service` — systemd multi-instance template unit.
+- `/version` slash command — displays version, instance, backend; shows upgrade hint when newer release is available.
+- `WECHATBRIDGE_ADMINS`, `WECHATBRIDGE_UPDATE_CHECK`, `WECHATBRIDGE_UPDATE_CHECK_INTERVAL` environment variables.
+
 ### Changed
 
+- **Installation method changed to pipx** as the sole official install path. The old `git clone + pip install -r requirements.txt` path is removed; developers use `pip install -e .` from a clone.
+- Version single source of truth is `wechatbridge/__init__.py` (`__version__`); `pyproject.toml` uses `dynamic = ["version"]`.
+- systemd unit now uses the pipx-installed binary directly (`%h/.local/bin/wechatbridge`) instead of `python -m wechatbridge` with a `WorkingDirectory`.
 - Bilingual READMEs aligned with real capabilities: dual backend (agy/grok), tightened wording for danger gate, artifacts, `/mcp`/`/agent`, `/fast`/`/planning`, grok `/add-dir`; added Ops & security section.
 - Dangerous-confirm WeChat prompt now shows `WECHATBRIDGE_CONFIRM_TOKEN` instead of hard-coded `y`.
 - Package description (`pyproject.toml`, package docstring) mentions agy and Grok Build.
 - Windows deploy notes use instance-scoped paths (`…\wechatbridge\<instance>\…`).
+- Repository root `.env` fallback emits a deprecation warning on startup.
+- Windows and macOS (launchd) deploy notes updated for pipx installs; `deploy/update.sh` defaults to the `wechatbridge` system user when run as root.
+
+### Removed
+
+- `requirements.txt` (dependencies are declared in `pyproject.toml` only).
 
 ## [1.2.2] - 2026-07-25
 

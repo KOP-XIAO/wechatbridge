@@ -1,5 +1,5 @@
 [Unit]
-Description=WeChat Bridge Service
+Description=WeChat Bridge Service (instance %i)
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,10 @@ Type=simple
 # ExecStart uses %h which resolves to the home directory of the User specified below.
 # Make sure the service user has run: pipx install wechatbridge
 ExecStart=%h/.local/bin/wechatbridge
-EnvironmentFile=-%h/.config/wechatbridge/.env
+# Instance-specific config: ~/.config/wechatbridge/%i.env
+# Falls back to ~/.config/wechatbridge/.env
+EnvironmentFile=-%h/.config/wechatbridge/%i.env
+Environment=WECHATBRIDGE_INSTANCE=%i
 Environment=PYTHONUNBUFFERED=1
 Restart=always
 RestartSec=5s

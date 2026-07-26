@@ -1,11 +1,26 @@
 [project]
 name = "wechatbridge"
-version = "1.2.2"
-description = "Bridge WeChat messages to agy or Grok Build CLIs — text/image/file/voice in, replies and selected artifacts back."
+dynamic = ["version"]
+description = "Bridge WeChat messages to agy or Grok Build CLIs — text/image/file/voice in, CLI replies and generated files back."
 requires-python = ">=3.10"
 license = { text = "MIT" }
+urls = { Homepage = "https://github.com/dorokuma/wechatbridge", Repository = "https://github.com/dorokuma/wechatbridge", Issues = "https://github.com/dorokuma/wechatbridge/issues", Changelog = "https://github.com/dorokuma/wechatbridge/blob/main/CHANGELOG.md" }
 authors = [
     { name = "WeChatBridge contributors" },
+]
+keywords = ["wechat", "bot", "bridge", "agy", "grok"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: Chinese (Simplified)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
 ]
 dependencies = [
     "httpx",
@@ -23,3 +38,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["wechatbridge"]
+
+[tool.setuptools.dynamic]
+version = { attr = "wechatbridge.__version__" }

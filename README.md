@@ -54,23 +54,63 @@ Per-user switch: `/backend agy` or `/backend grok`. Each backend keeps its own m
 
 ## Install
 
+The recommended way is with [pipx](https://pypa.github.io/pipx/) (Python >= 3.10 required):
+
+```bash
+pipx install wechatbridge
+```
+
+After installation, verify:
+
+```bash
+wechatbridge --version
+```
+
+### Install pipx
+
+**Debian / Ubuntu:**
+
+```bash
+sudo apt install pipx
+```
+
+**Other systems (or to get the latest version):**
+
+```bash
+python3 -m pip install --user pipx && python3 -m pipx ensurepath
+```
+
+Then start a new shell or re-source your shell config so `pipx` is on `PATH`.
+
+### Developers
+
+If you want to hack on the source:
+
 ```bash
 git clone https://github.com/dorokuma/wechatbridge.git
 cd wechatbridge
-pip install -r requirements.txt
-```
-
-Or install as a package:
-
-```bash
 pip install -e .
 ```
 
 ## Configure
 
+Configuration is loaded from the first location found:
+
+1. `$WECHATBRIDGE_ENV_FILE` — explicit path
+2. `$XDG_CONFIG_HOME/wechatbridge/<instance>.env` (defaults to `~/.config/wechatbridge/<instance>.env`)
+3. `$XDG_CONFIG_HOME/wechatbridge/.env` (defaults to `~/.config/wechatbridge/.env`)
+4. `.env` in the repository root — **deprecated** (prints a warning on startup)
+
+The instance name defaults to `default`; override with `WECHATBRIDGE_INSTANCE`.
+
+Get the example config:
+
 ```bash
-cp deploy/wechatbridge.env.example .env
+mkdir -p ~/.config/wechatbridge
+curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/wechatbridge.env.example
 ```
+
+Then edit `~/.config/wechatbridge/.env` with your settings.
 
 Key variables (all have defaults):
 
@@ -88,28 +128,67 @@ Key variables (all have defaults):
 | `WECHATBRIDGE_CONFIRM_TOKEN` | `y` | reply this token to approve a gated dangerous prompt |
 | `WECHATBRIDGE_ENABLE_MCP` | `true` | enable the `/mcp` help text command |
 | `WECHATBRIDGE_ENABLE_SUBAGENT` | `true` | enable the `/agent` prompt-rewrite command |
+| `WECHATBRIDGE_ADMINS` | _empty_ | comma-separated wxid list; admins receive WeChat notification when a new version is detected |
+| `WECHATBRIDGE_UPDATE_CHECK` | `true` | check PyPI for new versions on startup and every 24h; failures are silent |
+| `WECHATBRIDGE_UPDATE_CHECK_INTERVAL` | `86400` | update check interval in seconds |
 
 Full list: [`deploy/wechatbridge.env.example`](deploy/wechatbridge.env.example).
+
+> **Why the new config location?** With pipx the package is installed globally, so a `.env` next to the source no longer makes sense. The XDG base directory layout keeps your config separate and instance-aware.
 
 ## Run
 
 ```bash
-python -m wechatbridge
+wechatbridge
 ```
 
 On first run the bridge prints a QR code (and saves PNG under the instance data dir). Scan with WeChat to bind, then it long-polls for messages.
+
+## Upgrading
+
+```bash
+pipx upgrade wechatbridge
+sudo systemctl restart wechatbridge
+```
+
+Or run the upgrade script (no clone needed — fetch it with curl):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/update.sh | sudo bash
+```
+
+The script upgrades the pipx installation and restarts the service. If the service runs as a dedicated system user (e.g. `wechatbridge`), running as root automatically runs pipx as that user (override with `WECHATBRIDGE_USER=<user>`).
+
+Data lives under `~/.local/share/wechatbridge/<instance>/` (sessions, SQLite history, QR codes, login state) and is **not** touched during upgrade — your bots stay logged in and conversations are preserved.
+
+Before upgrading a **major** or **minor** version (e.g. 1.2 → 1.3), check the corresponding section in [`CHANGELOG.md`](CHANGELOG.md) for breaking changes and migration steps.
 
 ## Deploy
 
 ### Linux (systemd)
 
+First, install the bridge under the `wechatbridge` system user:
+
+```bash
+sudo -u wechatbridge pipx install wechatbridge
+```
+
+Then deploy the service unit:
+
 ```bash
 sudo cp deploy/wechatbridge.service /etc/systemd/system/
-# edit WorkingDirectory and User
 sudo systemctl enable --now wechatbridge
 ```
 
-**Multi-instance:** set a different `WECHATBRIDGE_INSTANCE` in each unit. Paths for state, sessions, and QR code are derived automatically.
+**Multi-instance:** copy the template `deploy/wechatbridge@.service` and enable instances:
+
+```bash
+sudo cp deploy/wechatbridge@.service /etc/systemd/system/
+sudo systemctl enable --now wechatbridge@bot2
+sudo systemctl enable --now wechatbridge@bot3
+```
+
+Each instance reads its own config file (`~/.config/wechatbridge/bot2.env`) and keeps state under its own data directory (`~/.local/share/wechatbridge/bot2/`).
 
 ### macOS (launchd)
 
@@ -137,8 +216,9 @@ See [`deploy/wechatbridge-windows.md`](deploy/wechatbridge-windows.md).
 | `/add-dir <path>` | **agy:** pass `--add-dir` on later runs if path is allowed. **grok:** recorded only; not passed to the CLI yet |
 | `/agents` | list agents via the active CLI |
 | `/persona <text>` | set persona (`show` / `clear` / `reset` subcommands) |
+| `/version` | show current version, instance name, and backend; if a newer version is available, show upgrade hint |
 | `/mcp` | short MCP **usage hint** text (can disable with `WECHATBRIDGE_ENABLE_MCP`) |
-| `/agent <name> <task>` | craft a “invoke subagent …” prompt and run the CLI (can disable with `WECHATBRIDGE_ENABLE_SUBAGENT`) |
+| `/agent <name> <task>` | craft a "invoke subagent …" prompt and run the CLI (can disable with `WECHATBRIDGE_ENABLE_SUBAGENT`) |
 
 Other `/…` commands are either rejected (e.g. `/exit`), reported as unsupported on WeChat (TUI-only panels), or passed through to the active CLI.
 

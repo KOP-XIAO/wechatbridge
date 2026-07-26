@@ -10,26 +10,74 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 logger = logging.getLogger(__name__)
 
 
+def _parse_env_file(path: str) -> None:
+    """Parse a .env file and load variables into os.environ (does not override existing)."""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip().strip("'\"")
+                    if k and k not in os.environ:
+                        os.environ[k] = v
+    except Exception as e:
+        logger.warning("Failed to load .env file %s: %s", path, e)
+
+
 def _load_env_file():
-    """Automatically load .env file if present."""
-    env_path = os.getenv("WECHATBRIDGE_ENV_FILE", os.path.join(os.path.dirname(_BASE_DIR), ".env"))
-    if not os.path.exists(env_path):
-        env_path = os.path.join(_BASE_DIR, ".env")
+    """Automatically load .env file if present (precedence: explicit > XDG per-instance > XDG shared > repo root)."""
+    # 1. WECHATBRIDGE_ENV_FILE (explicit, highest priority)
+    env_path = os.getenv("WECHATBRIDGE_ENV_FILE")
+    if env_path:
+        if os.path.exists(env_path):
+            logger.info("加载 .env 文件: %s (由 WECHATBRIDGE_ENV_FILE 指定)", env_path)
+            _parse_env_file(env_path)
+        else:
+            logger.warning("WECHATBRIDGE_ENV_FILE 指定的 .env 文件不存在: %s", env_path)
+        return
+
+    # 2. XDG_CONFIG_HOME/wechatbridge/<instance>.env
+    xdg_config = os.getenv("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+    instance = os.getenv("WECHATBRIDGE_INSTANCE", "default")
+    env_path = os.path.join(xdg_config, "wechatbridge", f"{instance}.env")
     if os.path.exists(env_path):
-        try:
-            with open(env_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith("#") and "=" in line:
-                        k, v = line.split("=", 1)
-                        k, v = k.strip(), v.strip().strip("'\"")
-                        if k and k not in os.environ:
-                            os.environ[k] = v
-        except Exception as e:
-            logger.warning("Failed to load .env file %s: %s", env_path, e)
+        logger.info("加载 .env 文件: %s", env_path)
+        _parse_env_file(env_path)
+        return
+
+    # 3. XDG_CONFIG_HOME/wechatbridge/.env (instance-independent shared)
+    env_path = os.path.join(xdg_config, "wechatbridge", ".env")
+    if os.path.exists(env_path):
+        logger.info("加载 .env 文件: %s", env_path)
+        _parse_env_file(env_path)
+        return
+
+    # 4. (Deprecated) Package parent directory — repo root .env
+    env_path = os.path.join(os.path.dirname(_BASE_DIR), ".env")
+    if os.path.exists(env_path):
+        logger.warning(
+            "已废弃: .env 文件位于 %s，请迁移到 %s",
+            env_path,
+            os.path.join(xdg_config, "wechatbridge", f"{instance}.env"),
+        )
+        _parse_env_file(env_path)
+
+
+_DEPRECATED_ENV: dict = {}  # "OLD_NAME": "NEW_NAME" — when old is set but new isn't, copy value and warn
+
+
+def _apply_deprecated_env():
+    """Apply deprecated env var mappings: copy old value to new name."""
+    for old, new in _DEPRECATED_ENV.items():
+        old_val = os.getenv(old)
+        if old_val is not None and os.getenv(new) is None:
+            os.environ[new] = old_val
+            logger.warning("环境变量 %s 已废弃，请改用 %s（当前值已自动复制）", old, new)
 
 
 _load_env_file()
+_apply_deprecated_env()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -166,6 +214,17 @@ class AppConfig:
         for s in os.getenv("WECHATBRIDGE_ALLOWED_SENDERS", "").split(",")
         if s.strip()
     ]
+
+    # Admin users: comma-separated wxid list, receive update notifications etc.
+    admin_users: list = [
+        s.strip()
+        for s in os.getenv("WECHATBRIDGE_ADMINS", "").split(",")
+        if s.strip()
+    ]
+
+    # Periodic update check to PyPI
+    update_check_enabled: bool = os.getenv("WECHATBRIDGE_UPDATE_CHECK", "true").lower() == "true"
+    update_check_interval: int = _env_int("WECHATBRIDGE_UPDATE_CHECK_INTERVAL", 86400)
 
     # Enable /mcp slash command (agy MCP tool guidance)
     enable_mcp: bool = os.getenv("WECHATBRIDGE_ENABLE_MCP", "true").lower() == "true"

@@ -2,21 +2,34 @@
 
 ## Quick Start
 
+Install with [pipx](https://pypa.github.io/pipx/) (requires Python >= 3.10):
+
 ```cmd
-git clone https://github.com/dorokuma/wechatbridge.git
-cd wechatbridge
-pip install -r requirements.txt
-copy deploy\wechatbridge.env.example .env
-python -m wechatbridge
+py -m pip install --user pipx
+py -m pipx ensurepath
+pipx install wechatbridge
+```
+
+Configure (create `%USERPROFILE%\.config\wechatbridge\.env`, see `deploy\wechatbridge.env.example` for all options), then run:
+
+```cmd
+wechatbridge
 ```
 
 ## Autostart via Task Scheduler
 
 1. Open Task Scheduler -> Create Task
-2. Action: Start a program -> `pythonw.exe` with arguments `-m wechatbridge`
-3. Set Working Directory to the repo root
-4. Trigger: At log on
-5. Settings: Restart on failure, every 1 minute, up to 3 times
+2. Action: Start a program -> `%USERPROFILE%\.local\bin\wechatbridge.exe` (the pipx-installed entry point)
+3. Trigger: At log on
+4. Settings: Restart on failure, every 1 minute, up to 3 times
+
+## Upgrade
+
+```cmd
+pipx upgrade wechatbridge
+```
+
+Config lives under `%USERPROFILE%\.config\wechatbridge\` and data under `%USERPROFILE%\.local\share\wechatbridge\`, so upgrades never touch either.
 
 ## Notes
 
