@@ -53,7 +53,7 @@ Releases are semi-automated. A maintainer only needs to:
 
 1. **Update the version** — change `__version__` in `wechatbridge/__init__.py` to the new version.
 2. **Update CHANGELOG** — rename `[Unreleased]` to `[X.Y.Z] - YYYY-MM-DD` and add a fresh empty `[Unreleased]` heading above it.
-3. **Tag and push** — create a signed tag `vX.Y.Z` and push it:
+3. **Tag and push** — create an annotated tag `vX.Y.Z` and push it:
 
    ```bash
    git tag -a vX.Y.Z -m "vX.Y.Z"
@@ -66,14 +66,14 @@ The tag push triggers the `.github/workflows/release.yml` workflow which:
 - Builds the package and publishes it to **PyPI** via [trusted publishing](https://docs.pypi.org/trusted-publishers/).
 - Extracts the `[X.Y.Z]` section from `CHANGELOG.md` and creates a **GitHub Release** with it.
 
-### One-time PyPI setup (required before the first automated release)
+### One-time PyPI setup (already configured 2026-07-26 — reference for re-setup)
 
-Until this is done, the tag-triggered workflow will fail at the PyPI publish step. A maintainer must configure:
+If the trusted publisher or GitHub environment ever needs to be recreated:
 
-1. On [PyPI project settings](https://pypi.org/manage/project/wechatbridge-cli/settings/):
-   - Added a **trusted publisher** with:
+1. On [PyPI project settings](https://pypi.org/manage/project/wechatbridge-cli/settings/) (for the very first publish of a new project, use the account-level [pending publisher](https://pypi.org/manage/account/publishing/) page instead):
+   - Add a **trusted publisher** with:
      - Repository: `dorokuma/wechatbridge`
-     - Workflow: `release.yml`
+     - Workflow: `release.yml` — must match the workflow **file name** exactly (`release.yml`, not `release.yaml`, not the display name `Release`)
      - Environment: `pypi`
 2. On GitHub repository:
    - Created an environment called `pypi` (no secrets needed — trusted publishing uses OIDC).
