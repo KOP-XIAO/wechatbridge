@@ -39,6 +39,8 @@ def _is_allowed_media_url(url: str) -> bool:
         return False
     if host == "weixin.qq.com" or host.endswith(".weixin.qq.com"):
         return True
+    if host == "wechat.com" or host.endswith(".wechat.com"):
+        return True
     if host == "qq.com" or host.endswith(".qq.com"):
         # WeChat CDN commonly uses *.cdn.weixin.qq.com / *.qq.com
         if "weixin" in host or "cdn" in host or "novac" in host:
@@ -799,7 +801,15 @@ class ILinkClient:
 
         # Build download URL
         if full_url:
-            url = full_url
+            if _is_allowed_media_url(full_url):
+                url = full_url
+            elif encrypt_query_param:
+                logger.warning(
+                    "CDN full_url %s 不在白名单内，回退到构造URL", full_url[:120]
+                )
+                url = f"{config.cdn_base_url}/download?encrypted_query_param={quote(encrypt_query_param)}"
+            else:
+                raise ValueError(f"拒绝非微信 CDN 下载地址: {full_url[:120]}")
         else:
             url = f"{config.cdn_base_url}/download?encrypted_query_param={quote(encrypt_query_param)}"
 
