@@ -57,7 +57,7 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 推荐使用 [pipx](https://pypa.github.io/pipx/)（需要 Python >= 3.10）：
 
 ```bash
-pipx install wechatbridge
+pipx install wechatbridge-cli
 ```
 
 安装后验证：
@@ -147,7 +147,7 @@ wechatbridge
 ## 升级
 
 ```bash
-pipx upgrade wechatbridge
+pipx upgrade wechatbridge-cli
 sudo systemctl restart wechatbridge
 ```
 
@@ -170,7 +170,7 @@ curl -fsSL https://raw.githubusercontent.com/dorokuma/wechatbridge/main/deploy/u
 首先，在 `wechatbridge` 系统用户下安装：
 
 ```bash
-sudo -u wechatbridge pipx install wechatbridge
+sudo -u wechatbridge pipx install wechatbridge-cli
 ```
 
 然后部署服务 unit：

@@ -70,7 +70,7 @@ The tag push triggers the `.github/workflows/release.yml` workflow which:
 
 Until this is done, the tag-triggered workflow will fail at the PyPI publish step. A maintainer must configure:
 
-1. On [PyPI project settings](https://pypi.org/manage/project/wechatbridge/settings/):
+1. On [PyPI project settings](https://pypi.org/manage/project/wechatbridge-cli/settings/):
    - Added a **trusted publisher** with:
      - Repository: `dorokuma/wechatbridge`
      - Workflow: `release.yml`
@@ -81,7 +81,7 @@ Until this is done, the tag-triggered workflow will fail at the PyPI publish ste
 ### Recommended upgrade path for users (document in CHANGELOG if breaking)
 
 ```bash
-pipx upgrade wechatbridge && sudo systemctl restart wechatbridge
+pipx upgrade wechatbridge-cli && sudo systemctl restart wechatbridge
 ```
 
 Or via the deploy script:

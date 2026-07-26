@@ -14,7 +14,7 @@ from .config import config
 
 logger = logging.getLogger(__name__)
 
-PYPI_URL = "https://pypi.org/pypi/wechatbridge/json"
+PYPI_URL = "https://pypi.org/pypi/wechatbridge-cli/json"
 RELEASES_URL = "https://github.com/dorokuma/wechatbridge/releases"
 
 
@@ -91,7 +91,7 @@ async def update_check_loop() -> None:
                     if is_newer(version):
                         logger.warning(
                             "发现新版本: 当前 %s → 最新 %s。"
-                            "更新: `pipx upgrade wechatbridge` | %s",
+                            "更新: `pipx upgrade wechatbridge-cli` | %s",
                             __version__, version, RELEASES_URL,
                         )
                 elif version == latest_version:
@@ -122,7 +122,7 @@ def format_update_hint() -> str:
     if not update_available():
         return ""
     return (
-        f"\n\n🆕 发现新版本 `{latest_version}`，更新：`pipx upgrade wechatbridge`"
+        f"\n\n🆕 发现新版本 `{latest_version}`，更新：`pipx upgrade wechatbridge-cli`"
     )
 
 
@@ -153,7 +153,7 @@ async def maybe_notify_admin(client, from_user: str, context_token: str) -> None
         f"🆕 **wechatbridge 有新版本** 🆕\n\n"
         f"当前 `{__version__}` → 最新 `{latest_version}`\n\n"
         f"更新方法：\n"
-        f"`pipx upgrade wechatbridge && sudo systemctl restart wechatbridge`\n\n"
+        f"`pipx upgrade wechatbridge-cli && sudo systemctl restart wechatbridge`\n\n"
         f"更新内容：{RELEASES_URL}"
     )
 

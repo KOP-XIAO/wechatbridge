@@ -1,5 +1,5 @@
 [project]
-name = "wechatbridge"
+name = "wechatbridge-cli"
 dynamic = ["version"]
 description = "Bridge WeChat messages to agy or Grok Build CLIs — text/image/file/voice in, CLI replies and generated files back."
 requires-python = ">=3.10"

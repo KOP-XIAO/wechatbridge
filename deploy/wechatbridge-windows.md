@@ -7,7 +7,7 @@ Install with [pipx](https://pypa.github.io/pipx/) (requires Python >= 3.10):
 ```cmd
 py -m pip install --user pipx
 py -m pipx ensurepath
-pipx install wechatbridge
+pipx install wechatbridge-cli
 ```
 
 Configure (create `%USERPROFILE%\.config\wechatbridge\.env`, see `deploy\wechatbridge.env.example` for all options), then run:
@@ -26,7 +26,7 @@ wechatbridge
 ## Upgrade
 
 ```cmd
-pipx upgrade wechatbridge
+pipx upgrade wechatbridge-cli
 ```
 
 Config lives under `%USERPROFILE%\.config\wechatbridge\` and data under `%USERPROFILE%\.local\share\wechatbridge\`, so upgrades never touch either.

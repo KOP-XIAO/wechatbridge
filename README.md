@@ -57,7 +57,7 @@ Per-user switch: `/backend agy` or `/backend grok`. Each backend keeps its own m
 The recommended way is with [pipx](https://pypa.github.io/pipx/) (Python >= 3.10 required):
 
 ```bash
-pipx install wechatbridge
+pipx install wechatbridge-cli
 ```
 
 After installation, verify:
@@ -147,7 +147,7 @@ On first run the bridge prints a QR code (and saves PNG under the instance data 
 ## Upgrading
 
 ```bash
-pipx upgrade wechatbridge
+pipx upgrade wechatbridge-cli
 sudo systemctl restart wechatbridge
 ```
 
@@ -170,7 +170,7 @@ Before upgrading a **major** or **minor** version (e.g. 1.2 → 1.3), check the 
 First, install the bridge under the `wechatbridge` system user:
 
 ```bash
-sudo -u wechatbridge pipx install wechatbridge
+sudo -u wechatbridge pipx install wechatbridge-cli
 ```
 
 Then deploy the service unit:

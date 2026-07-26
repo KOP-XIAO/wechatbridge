@@ -43,10 +43,10 @@ fi
 # --- Upgrade (or install if not present) ---
 echo "Upgrading WeChatBridge..."
 if run_pipx list 2>/dev/null | grep -q "wechatbridge"; then
-    run_pipx upgrade wechatbridge
+    run_pipx upgrade wechatbridge-cli
 else
     echo "WeChatBridge not yet installed under '$TARGET_USER'. Installing..."
-    run_pipx install wechatbridge
+    run_pipx install wechatbridge-cli
 fi
 
 # --- Print new version ---
