@@ -5,9 +5,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-07-27
+
 ### Added
 
-- **Codex backend**: third CLI backend (OpenAI Codex) alongside agy and grok, switchable per-user via `/backend codex`. Runs `codex exec --json` for single turns and `codex exec resume <thread_id> <prompt>` to continue (thread id persisted per user). Each WeChat user runs with `HOME` and `CODEX_HOME` isolated to their own session dir. Auth via a linked host `~/.codex/auth.json` (or `CODEX_API_KEY` in the bridge environment); no key or token values are committed. **Status:** no real Codex subscription or CLI was available for live testing — the backend is validated through source research, a JSONL fixture, and a fake CLI in the test suite (the full fake-CLI/fixture test suite passes); final acceptance is by real users against the actual CLI.
+- **Codex backend**: third CLI backend (OpenAI Codex) alongside agy and grok, switchable per-user via `/backend codex`. Runs `codex exec --json` for single turns and `codex exec resume <thread_id> <prompt>` to continue (thread id persisted per user). Each WeChat user runs with `HOME` and `CODEX_HOME` isolated to their own session dir. Auth via a linked host `~/.codex/auth.json` (or `CODEX_API_KEY` in the bridge environment); no key or token values are committed.
+  - **Verification boundary:** no real Codex subscription or CLI was available for live testing. The backend is implemented against the documented `codex exec --json` / `resume` contract and validated by the in-repo test suite using a JSONL fixture and a fake `codex` CLI (the full fake-CLI/fixture test suite passes). Real end-to-end acceptance against the actual Codex CLI is pending real-user testing.
 
 ## [1.3.5] - 2026-07-27
 
