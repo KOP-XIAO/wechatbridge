@@ -1,7 +1,7 @@
 """
 wechatbridge Main Entry Point.
 Active iLink client that receives WeChat messages and responds via CLI backends.
-Architecture: WeChat ClawBot(iLink) <-> wechatbridge(Python) <-> agy/grok CLI
+Architecture: WeChat ClawBot(iLink) <-> wechatbridge(Python) <-> agy/grok/codex CLIs
 """
 
 import argparse
@@ -20,6 +20,7 @@ from .config import config, ensure_runtime_dirs
 from .ilink import ILinkClient
 from .runner_common import (
     clean_session_media,
+    clear_initialized,
     format_error,
     format_model_label,
     format_oversized_artifact_notice,
@@ -29,6 +30,7 @@ from .runner_common import (
     path_is_under,
     save_prefs,
     switch_backend_prefs,
+    validate_add_dir,
 )
 from .update_check import update_check_loop, maybe_notify_admin, format_update_hint
 
@@ -112,7 +114,7 @@ def _is_duplicate_msg(msg: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Backend dispatcher — routes to agy or grok based on per-user preference
+# Backend dispatcher — routes to agy, grok, or codex based on per-user preference
 # ---------------------------------------------------------------------------
 
 def _get_backend(user_id: str) -> str:
@@ -127,6 +129,9 @@ async def _run_llm(prompt: str, user_id: str) -> tuple[str, list]:
     if backend == "grok":
         from .grok import run_grok
         return await run_grok(prompt, user_id)
+    elif backend == "codex":
+        from .codex import run_codex
+        return await run_codex(prompt, user_id)
     else:
         from .agy import run_agy
         return await run_agy(prompt, user_id)
@@ -165,13 +170,16 @@ async def _handle_slash(client: ILinkClient, text: str, user_id: str, context_to
     if backend == "grok":
         from .grok import handle_grok_slash_command
         return await handle_grok_slash_command(text, user_id)
+    elif backend == "codex":
+        from .codex import handle_codex_slash_command
+        return await handle_codex_slash_command(text, user_id)
     else:
         from .agy import handle_slash_command
         return await handle_slash_command(text, user_id)
 
 
 def _cmd_backend(args: str, user_id: str) -> str:
-    """Handle /backend <agy|grok> — switch CLI backend per user.
+    """Handle /backend <agy|grok|codex> — switch CLI backend per user.
 
     Switching restores that backend's remembered model/effort/mode (or empty
     project default on first visit), and resets the conversation so the new
@@ -185,10 +193,10 @@ def _cmd_backend(args: str, user_id: str) -> str:
         return (
             f"📋 **当前助手引擎** 📋\n\n`{current}`\n"
             f"模型: `{model_label}`\n\n"
-            "用法: `/backend agy` 或 `/backend grok`"
+            "用法: `/backend agy` 或 `/backend grok` 或 `/backend codex`"
         )
-    if name not in ("agy", "grok"):
-        return "❌ **未知引擎** ❌\n\n支持: `agy` / `grok`\n\n`/backend agy` 或 `/backend grok`"
+    if name not in ("agy", "grok", "codex"):
+        return "❌ **未知引擎** ❌\n\n支持: `agy` / `grok` / `codex`\n\n`/backend agy` 或 `/backend grok` 或 `/backend codex`"
     prefs = load_prefs(user_id)
     old, new = switch_backend_prefs(prefs, name)
     save_prefs(user_id, prefs)
@@ -196,9 +204,11 @@ def _cmd_backend(args: str, user_id: str) -> str:
     # Reset session so new backend starts fresh (only when actually changed)
     if old != new:
         session_dir = get_session_dir(user_id)
-        flag = os.path.join(session_dir, ".initialized")
-        if os.path.exists(flag):
-            os.remove(flag)
+        clear_initialized(session_dir, backend=new)
+        # codex 的续聊依赖 .codex_thread_id，切换时一并清掉避免指向旧会话
+        if new == "codex":
+            from .codex import _delete_codex_thread_id
+            _delete_codex_thread_id(session_dir)
         return (
             f"✅ **助手引擎已切换** ✅\n\n"
             f"`{old}` → `{new}`\n"
@@ -382,9 +392,27 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
     """
     session_dir = get_session_dir(from_user)
     backend = _get_backend(from_user)
+    add_dirs = []
     if backend == "grok":
         # grok runs with cwd=session_dir, artifacts are under session_dir
         allowed_root = session_dir
+    elif backend == "codex":
+        # codex runs with cwd=session_dir; file_change paths may also land in
+        # user-approved --add-dir roots, so allow those too.
+        allowed_root = session_dir
+        prefs = load_prefs(from_user)
+        # Second-factor verification of stored --add-dir roots at send time.
+        # Only keep roots that currently exist, are real directories, and still
+        # resolve inside the configured allowed roots (session dir + config
+        # add_dir_roots). Deleted dirs, plain files, out-of-bounds paths and
+        # symlink escapes must not become artifact allow roots. Legitimate
+        # directories are kept (and still re-checked against each artifact path
+        # below). session_dir itself is never relaxed.
+        add_dirs = []
+        for d in prefs.get("add_dirs", []) or []:
+            ok, resolved = validate_add_dir(d, from_user)
+            if ok:
+                add_dirs.append(resolved)
     else:
         # agy writes to .gemini/antigravity-cli/scratch under session_dir
         allowed_root = os.path.join(session_dir, ".gemini", "antigravity-cli", "scratch")
@@ -392,8 +420,14 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
         try:
             # realpath check blocks symlink escape outside allowed root
             if not path_is_under(art_path, allowed_root):
-                logger.debug("skip non-scratch artifact: %s", art_path)
-                continue
+                ok_root = False
+                for d in add_dirs:
+                    if path_is_under(art_path, d):
+                        ok_root = True
+                        break
+                if not ok_root:
+                    logger.debug("skip non-scratch artifact: %s", art_path)
+                    continue
             if not os.path.isfile(os.path.realpath(art_path)):
                 logger.warning("Artifact not found: %s", art_path)
                 continue
@@ -937,7 +971,7 @@ async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(prog="wechatbridge", description="Bridge WeChat messages to agy or Grok Build CLIs — text/image/file/voice in, CLI replies and generated files back.")
+    parser = argparse.ArgumentParser(prog="wechatbridge", description="Bridge WeChat messages to agy, Grok Build, or Codex CLIs — text/image/file/voice in, CLI replies and generated files back.")
     parser.add_argument("--version", action="version", version=f"wechatbridge {__version__}")
     parser.parse_args()
     logger.info("wechatbridge v%s 启动 (backend=%s, instance=%s)", __version__, config.backend, config.instance)

@@ -115,9 +115,9 @@ class AppConfig:
     # iLink base URL (no trailing slash)
     ilink_base_url: str = os.getenv("ILINK_BASE_URL", "https://ilinkai.weixin.qq.com")
 
-    # Active CLI backend: "agy" or "grok" (global default, can be overridden per-user via /backend)
+    # Active CLI backend: "agy", "grok", or "codex" (global default, can be overridden per-user via /backend)
     backend: str = os.getenv("WECHATBRIDGE_BACKEND", "agy").lower()
-    if backend not in ("agy", "grok"):
+    if backend not in ("agy", "grok", "codex"):
         logger.warning("Unknown backend %r, falling back to 'agy'", backend)
         backend = "agy"
 
@@ -126,6 +126,9 @@ class AppConfig:
 
     # grok CLI binary path
     grok_binary_path: str = os.getenv("GROK_BIN_PATH", "grok")  # default assumes in PATH
+
+    # codex CLI binary path
+    codex_binary_path: str = os.getenv("CODEX_BIN_PATH", "codex")  # default assumes in PATH
 
     # Instance name (for multi-instance deployments)
     instance: str = _instance

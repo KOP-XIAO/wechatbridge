@@ -5,10 +5,10 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge connects a WeChat bot to agentic coding CLIs (Google's agy / Antigravity, or xAI's Grok Build). From WeChat you can send text, images, files, and voice-as-text to the active CLI, get replies back, and receive certain generated files over the WeChat CDN. Switch backends per user with `/backend` — no restart.
+WeChatBridge connects a WeChat bot to agentic coding CLIs (Google's agy / Antigravity, xAI's Grok Build, or OpenAI's Codex). From WeChat you can send text, images, files, and voice-as-text to the active CLI, get replies back, and receive certain generated files over the WeChat CDN. Switch backends per user with `/backend` — no restart.
 
 ```
-WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok CLI
+WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok / codex CLI
                                      (this project)    (runs tools)
 ```
 
@@ -16,10 +16,10 @@ The bridge process stays up and long-polls iLink. For prompts that go to a CLI, 
 
 ## Features
 
-- Text, image, file, and voice (WeChat server-side transcription only) go to the **active** backend (`agy` or `grok`)
+- Text, image, file, and voice (WeChat server-side transcription only) go to the **active** backend (`agy`, `grok`, or `codex`)
 - Detected CLI artifacts under the per-user allowed tree can be sent back (size-capped); not every file the CLI touches
 - Each WeChat user gets an isolated workspace; model / effort / mode are remembered **per backend**
-- Runtime backend switch: `/backend agy` or `/backend grok` (clears the “continue session” flag so the next CLI turn starts without `-c` / `--continue`; does not immediately wipe history files on disk)
+- Runtime backend switch: `/backend agy`, `/backend grok`, or `/backend codex` (clears that backend's continuation state — the agy/grok continuation flag and the codex `thread_id`/resume state — so the next CLI turn starts a fresh session; history files on disk are not wiped immediately)
 - Slash commands for model, session reset, persona, and more (see below)
 - Dangerous-prompt gate: a **keyword list** of concrete destructive patterns asks for confirmation before run
 - Sender whitelist (`WECHATBRIDGE_ALLOWED_SENDERS`; empty = allow all)
@@ -40,15 +40,24 @@ Default data paths expand from `~` (e.g. `~/.local/share/wechatbridge/<instance>
 
 - **agy** (default) — Google Antigravity CLI
 - **grok** — xAI Grok Build CLI
+- **codex** — OpenAI Codex CLI
 
-Per-user switch: `/backend agy` or `/backend grok`. Each backend keeps its own model / effort / mode memory and persona file layout. Global default is `WECHATBRIDGE_BACKEND`.
+Per-user switch: `/backend agy`, `/backend grok`, or `/backend codex`. Each backend keeps its own model / effort / mode memory and persona file layout. Global default is `WECHATBRIDGE_BACKEND`.
+
+### Codex backend notes
+
+- Runs `codex exec --json` for each single turn; conversation continuation uses `codex exec resume <thread_id> <prompt>` with the thread id persisted per user.
+- Isolation: each WeChat user runs with `HOME` and `CODEX_HOME` pointed at their own per-user session directory (`session_dir/.codex`), so sessions, logs, and caches never cross users.
+- Auth: the per-user session links to the host `~/.codex/auth.json` (copied as a fallback), reusing the host `codex login`. Alternatively, set `CODEX_API_KEY` in the bridge process environment to authenticate. No key or token values are stored in this repository.
+- **Status:** there is currently no real Codex subscription or CLI available for live testing. The codex backend is implemented from source research, a JSONL fixture, and a fake CLI used by the test suite (which passes). Final acceptance depends on a real user running it against the actual Codex CLI.
 
 ## Prerequisites
 
 - At least one CLI installed and signed in:
   - **agy** on `PATH`, or set `AGY_BIN_PATH`
   - **and/or grok** on `PATH`, or set `GROK_BIN_PATH`
-  - Antigravity is Google's terminal agentic coding CLI (successor to Gemini CLI). Grok Build is xAI's counterpart.
+  - **and/or codex** on `PATH`, or set `CODEX_BIN_PATH`
+  - Antigravity is Google's terminal agentic coding CLI (successor to Gemini CLI). Grok Build is xAI's counterpart; Codex is OpenAI's terminal agentic coding CLI.
 - A WeChat account with a [ClawBot / iLink](https://ilinkai.weixin.qq.com) bot (QR bind on first run)
 - Python 3.10+
 
@@ -118,10 +127,11 @@ Key variables (all have defaults):
 |---|---|---|
 | `AGY_BIN_PATH` | `agy` | path to the agy binary |
 | `GROK_BIN_PATH` | `grok` | path to the grok binary |
-| `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok`; overridable per user via `/backend`) |
+| `CODEX_BIN_PATH` | `codex` | path to the codex binary |
+| `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok` / `codex`; overridable per user via `/backend`) |
 | `WECHATBRIDGE_INSTANCE` | `default` | instance name; state / session / QR paths derive from it |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _empty_ | comma-separated WeChat IDs (empty = allow all) |
-| `AGY_TIMEOUT` | `600` | CLI run timeout in seconds (both backends) |
+| `AGY_TIMEOUT` | `600` | CLI run timeout in seconds (all three backends) |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | max file size sent back to WeChat (100 MB) |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | max inbound image/file after download (20 MB) |
 | `WECHATBRIDGE_MAX_CONCURRENT` | `4` | global concurrent process slots; same user serial (queue does not hold a slot); extras get a busy reply |
@@ -207,10 +217,10 @@ See [`deploy/wechatbridge-windows.md`](deploy/wechatbridge-windows.md).
 | Command | Action |
 |---|---|
 | `/help` | list supported commands for the active backend |
-| `/backend <agy\|grok>` | switch CLI backend for this WeChat user (on real change: drop continue flag; history files may remain until retention cleanup) |
+| `/backend <agy\|grok\|codex>` | switch CLI backend for this WeChat user (on real change: clears that backend's continuation state — agy/grok flag and codex `thread_id`/resume — so the next turn starts a fresh session; history files may remain until retention cleanup) |
 | `/clear` or `/new` | drop continue flag so the next CLI turn is a new conversation (does not instantly delete history files) |
-| `/model <name>` | set model (validated against the backend's model list; see `/models`) |
-| `/models` | list models from the active CLI |
+| `/model <name>` | set model (validation differs by backend: agy/grok check against the live model list; codex stores the name without verifying, so a typo only surfaces on the next run; see `/models`) |
+| `/models` | list models — agy/grok query the live CLI; codex returns a built-in reference list, not your actual account's models |
 | `/fast` | set low reasoning effort (**on only** — not a toggle; no “off” command) |
 | `/planning` | set planning mode (**on only** — not a toggle) |
 | `/add-dir <path>` | **agy:** pass `--add-dir` on later runs if path is allowed. **grok:** recorded only; not passed to the CLI yet |
@@ -239,7 +249,8 @@ Other `/…` commands are either rejected (e.g. `/exit`), reported as unsupporte
 
 ## Limitations
 
-- Not a standalone agent — requires agy and/or grok.
+- Not a standalone agent — requires agy and/or grok and/or codex.
+- The **codex** backend is not yet verified against a real Codex subscription/CLI; it is validated by source research, a JSONL fixture, and a fake CLI in tests. Treat it as community-tested until a real user confirms.
 - Voice is WeChat speech-to-text only; no local ASR; empty transcript → “type instead”.
 - No video send/receive; no native WeChat voice-bubble replies (no silk encode).
 - One WeChat binding per process; multiple accounts need multiple instances (`WECHATBRIDGE_INSTANCE`).
