@@ -230,6 +230,39 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
         raw,
     )
 
+    # codex-specific auth/login recognition (backend-scoped, precise).
+    # Only explicit login semantics match, so ordinary API errors, rate
+    # limits and model errors are never misclassified as a login problem.
+    # agy/grok keep using the generic block below (results unchanged).
+    if backend == "codex":
+        if (
+            "codex login" in lower
+            or "codex_api_key" in lower
+            or "codex api key" in lower
+            or "codex api-key" in lower
+            or "authentication required" in lower
+            or "not authenticated" in lower
+            or "not logged in" in lower
+            or "logged out" in lower
+            or "login required" in lower
+            or "log in to continue" in lower
+            or "login to continue" in lower
+            or "must be logged in" in lower
+            or "you must be logged in" in lower
+            or "no valid credentials" in lower
+            or "missing credentials" in lower
+            or "invalid credentials" in lower
+            or "credentials required" in lower
+            or "please log in" in lower
+            or "please login" in lower
+            or "unauthorized" in lower
+            or "401" in lower and ("auth" in lower or "token" in lower or "login" in lower)
+        ):
+            return format_error(
+                "未登录",
+                "助手尚未登录或凭证失效，请联系管理员处理。",
+            )
+
     # Auth / login — ops details stay in logs; users contact admin
     if (
         "not signed in" in lower
@@ -325,7 +358,7 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
 # Per-user preference persistence (per-backend model/effort/mode memory)
 # ---------------------------------------------------------------------------
 
-KNOWN_BACKENDS = ("agy", "grok")
+KNOWN_BACKENDS = ("agy", "grok", "codex")
 BACKEND_SCOPED_KEYS = ("model", "effort", "mode")
 
 
@@ -648,6 +681,7 @@ _SESSION_TEMP_REL_DIRS = (
     os.path.join(".gemini", "antigravity-cli", "log"),
     os.path.join(".gemini", "antigravity-cli", "cache"),
     os.path.join(".grok", "logs"),
+    os.path.join(".codex", "logs"),
 )
 
 # Dialogue history — cleaned as *units* (never split SQLite sidecars / session trees).
@@ -657,12 +691,14 @@ _HISTORY_CONVERSATIONS_REL = os.path.join(
 _HISTORY_BRAIN_REL = os.path.join(".gemini", "antigravity-cli", "brain")
 _HISTORY_KNOWLEDGE_REL = os.path.join(".gemini", "antigravity-cli", "knowledge")
 _HISTORY_GROK_SESSIONS_REL = os.path.join(".grok", "sessions")
+_HISTORY_CODEX_SESSIONS_REL = os.path.join(".codex", "sessions")
 
 _SESSION_HISTORY_REL_DIRS = (
     _HISTORY_CONVERSATIONS_REL,
     _HISTORY_BRAIN_REL,
     _HISTORY_KNOWLEDGE_REL,
     _HISTORY_GROK_SESSIONS_REL,
+    _HISTORY_CODEX_SESSIONS_REL,
 )
 
 # SQLite sidecar suffixes that must share fate with the main ``*.db`` file.
@@ -946,6 +982,84 @@ def _clean_grok_sessions(sessions_root: str, cutoff: float) -> int:
     return removed
 
 
+def _clean_codex_sessions(sessions_root: str, cutoff: float) -> int:
+    """Expire idle codex rollout files: sessions/YYYY/MM/DD/rollout-*.jsonl(.zst).
+
+    Unlike grok (which buckets by cwd-key), codex stores per-session rollouts
+    under date buckets. We expire individual rollout files by mtime (each file
+    is one session) and prune now-empty day/month/year directories.
+
+    Compressed rollouts (``rollout-*.jsonl.zst`` — feature off by default but
+    forward-compatible with /tmp/codex-src) are treated exactly like ``.jsonl``.
+    Only files whose name is ``rollout-*.jsonl`` or ``rollout-*.jsonl.zst`` are
+    ever touched here; auth.json / config / AGENTS.md / other session files are
+    never deleted by this function.
+    """
+    if not os.path.isdir(sessions_root):
+        return 0
+    removed = 0
+    try:
+        years = os.listdir(sessions_root)
+    except OSError as e:
+        logger.warning("Session cleanup list failed %s: %s", sessions_root, e)
+        return 0
+    for year in years:
+        yp = os.path.join(sessions_root, year)
+        if not os.path.isdir(yp):
+            continue
+        try:
+            months = os.listdir(yp)
+        except OSError as e:
+            logger.warning("Session cleanup list failed %s: %s", yp, e)
+            continue
+        for month in months:
+            mp = os.path.join(yp, month)
+            if not os.path.isdir(mp):
+                continue
+            try:
+                days = os.listdir(mp)
+            except OSError as e:
+                logger.warning("Session cleanup list failed %s: %s", mp, e)
+                continue
+            for day in days:
+                dp = os.path.join(mp, day)
+                if not os.path.isdir(dp):
+                    continue
+                try:
+                    files = os.listdir(dp)
+                except OSError as e:
+                    logger.warning("Session cleanup list failed %s: %s", dp, e)
+                    continue
+                for fn in files:
+                    if not (
+                        fn.startswith("rollout-")
+                        and (fn.endswith(".jsonl") or fn.endswith(".jsonl.zst"))
+                    ):
+                        continue
+                    fp = os.path.join(dp, fn)
+                    try:
+                        if os.path.isfile(fp) and os.lstat(fp).st_mtime < cutoff:
+                            os.remove(fp)
+                            removed += 1
+                            logger.info("Session cleanup: removed codex rollout %s", fp)
+                    except OSError as e:
+                        logger.warning("Session cleanup failed %s: %s", fp, e)
+                _try_rmdir_empty(dp)
+            _try_rmdir_empty(mp)
+        _try_rmdir_empty(yp)
+    return removed
+
+
+def _try_rmdir_empty(path: str) -> None:
+    """Remove dir if it is now empty (used by codex date-bucket pruning)."""
+    try:
+        if not os.listdir(path):
+            os.rmdir(path)
+            logger.info("Session cleanup: removed empty dir %s", path)
+    except OSError:
+        pass
+
+
 def _clean_user_history(user_dir: str, cutoff: float) -> int:
     """Unit-based dialogue history cleanup for one user session directory."""
     removed = 0
@@ -960,6 +1074,9 @@ def _clean_user_history(user_dir: str, cutoff: float) -> int:
     )
     removed += _clean_grok_sessions(
         os.path.join(user_dir, _HISTORY_GROK_SESSIONS_REL), cutoff
+    )
+    removed += _clean_codex_sessions(
+        os.path.join(user_dir, _HISTORY_CODEX_SESSIONS_REL), cutoff
     )
     return removed
 
@@ -998,6 +1115,28 @@ def _clear_initialized_if_no_history(user_dir: str) -> dict:
             except OSError as e:
                 logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
 
+    # codex: check only codex session dirs
+    codex_has = _dir_has_any_file(os.path.join(user_dir, _HISTORY_CODEX_SESSIONS_REL))
+    if not codex_has:
+        flag = os.path.join(user_dir, ".initialized.codex")
+        if os.path.exists(flag):
+            try:
+                os.remove(flag)
+                cleared["codex"] = True
+                logger.info(
+                    "Session cleanup: cleared .initialized.codex for %s (no codex history left)",
+                    user_dir,
+                )
+            except OSError as e:
+                logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
+        # 会话历史已空，残留的 thread_id 指向已删除的 rollout，一并清掉
+        tid = os.path.join(user_dir, ".codex_thread_id")
+        if os.path.exists(tid):
+            try:
+                os.remove(tid)
+            except OSError as e:
+                logger.warning("Session cleanup: failed to clear %s: %s", tid, e)
+
     # agy: check only agy conversation/brain/knowledge dirs
     agy_has = any(
         _dir_has_any_file(os.path.join(user_dir, rel))
@@ -1017,7 +1156,7 @@ def _clear_initialized_if_no_history(user_dir: str) -> dict:
                 logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
 
     # Legacy: clean shared .initialized if no history at all
-    if not grok_has and not agy_has:
+    if not grok_has and not agy_has and not codex_has:
         flag = os.path.join(user_dir, ".initialized")
         if os.path.exists(flag):
             try:

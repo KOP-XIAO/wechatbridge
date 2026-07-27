@@ -38,6 +38,6 @@ Config lives under `%USERPROFILE%\.config\wechatbridge\` and data under `%USERPR
 - Default session directory: `%USERPROFILE%\.local\share\wechatbridge\<instance>\sessions`
 - State / QR paths also live under that instance root unless overridden by env
 - Multi-instance: run separate processes with different `WECHATBRIDGE_INSTANCE` values
-- Subprocess env sets `HOME` and `USERPROFILE` to the **per-user session dir** (agy and grok)
+- Subprocess env sets `HOME` and `USERPROFILE` to the **per-user session dir** (agy, grok, and codex)
 - `os.chmod` is a no-op on Windows; token file permissions rely on NTFS ACLs
 - `os.setsid` (Unix process group) is not used on Windows; CLI subprocesses inherit the parent's process group

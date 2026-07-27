@@ -5,10 +5,10 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigravity，或 xAI Grok Build）。你可以在微信里发文字、图片、文件、语音（仅微信侧转写文字）给**当前后端**，拿回复，并在条件满足时把部分生成文件经 CDN 发回微信。每个用户可用 `/backend` 切换后端，无需重启进程。
+WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigravity、xAI Grok Build，或 OpenAI Codex）。你可以在微信里发文字、图片、文件、语音（仅微信侧转写文字）给**当前后端**，拿回复，并在条件满足时把部分生成文件经 CDN 发回微信。每个用户可用 `/backend` 切换后端，无需重启进程。
 
 ```
-微信(手机)  ⇄  iLink 机器人 API  ⇄  WeChatBridge  ⇄  agy / grok CLI
+微信(手机)  ⇄  iLink 机器人 API  ⇄  WeChatBridge  ⇄  agy / grok / codex CLI
                                  (本项目)           (跑工具)
 ```
 
@@ -16,10 +16,10 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 
 ## 功能
 
-- 文本、图片、文件、语音（仅微信服务端语音转文字）交给**当前激活**的后端（`agy` 或 `grok`）
+- 文本、图片、文件、语音（仅微信服务端语音转文字）交给**当前激活**的后端（`agy`、`grok` 或 `codex`）
 - 在用户允许目录内、且被识别到的 CLI 产物可回传微信（有大小上限）；不是 CLI 碰过的每个文件都会发
 - 每个微信用户独立工作区；模型 / 推理强度 / 模式按**后端**分别记忆
-- 运行时切换后端：`/backend agy` 或 `/backend grok`（真正切换时清掉「续聊」标记，下次 CLI 不再带 `-c` / `--continue`；磁盘上的历史文件不会立刻抹掉）
+- 运行时切换后端：`/backend agy`、`/backend grok` 或 `/backend codex`（真正切换时清除该后端续聊状态——agy/grok 的续聊标记与 codex 的 `thread_id`/resume 状态——下次 CLI 起新会话；磁盘上的历史文件不会立刻抹掉）
 - slash 指令：模型、清会话、人格等（见下表）
 - 危险提示闸门：对**明确破坏性关键词/模式**先确认再跑（不是全语义理解）
 - 白名单 `WECHATBRIDGE_ALLOWED_SENDERS`（空 = 全开）
@@ -40,15 +40,24 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 
 - **agy**（默认）— 谷歌 Antigravity CLI
 - **grok** — xAI Grok Build CLI
+- **codex** — OpenAI Codex CLI
 
-微信里 `/backend agy` 或 `/backend grok` 按用户切换。各后端各自记模型 / 强度 / 模式，人格文件布局也分开。全局默认见 `WECHATBRIDGE_BACKEND`。
+微信里 `/backend agy`、`/backend grok` 或 `/backend codex` 按用户切换。各后端各自记模型 / 强度 / 模式，人格文件布局也分开。全局默认见 `WECHATBRIDGE_BACKEND`。
+
+### codex 后端说明
+
+- 每轮以 `codex exec --json` 运行；续聊使用 `codex exec resume <thread_id> <prompt>`，thread id 按用户持久化。
+- 隔离：每个微信用户运行时把 `HOME` 与 `CODEX_HOME` 指到自己的会话目录（`session_dir/.codex`），会话、日志、缓存互不串。
+- 认证：每用户会话链接宿主 `~/.codex/auth.json`（fallback 为拷贝），复用宿主 `codex login`；也可在桥进程环境设 `CODEX_API_KEY` 认证。本仓库不存放任何 key / token 值。
+- **状态：** 目前没有真实 Codex 订阅或 CLI 可供实测。codex 后端基于源码研究、JSONL fixture 与测试用的 fake CLI 实现（测试通过），最终需由真实用户在真实 Codex CLI 上验收。
 
 ## 前置条件
 
 - 至少装好并登录其中一个 CLI：
   - **agy** 在 `PATH` 中，或设 `AGY_BIN_PATH`
   - **和/或 grok** 在 `PATH` 中，或设 `GROK_BIN_PATH`
-  - Antigravity 是谷歌终端 agentic 编程工具（Gemini CLI 官方继任）；Grok Build 是 xAI 同类产品
+  - **和/或 codex** 在 `PATH` 中，或设 `CODEX_BIN_PATH`
+  - Antigravity 是谷歌终端 agentic 编程工具（Gemini CLI 官方继任）；Grok Build 是 xAI 同类产品；Codex 是 OpenAI 终端 agentic 编程工具
 - 一个微信账号 + [ClawBot / iLink](https://ilinkai.weixin.qq.com) 机器人（首次扫码绑定）
 - Python 3.10+
 
@@ -118,10 +127,11 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 |---|---|---|
 | `AGY_BIN_PATH` | `agy` | agy 可执行文件路径 |
 | `GROK_BIN_PATH` | `grok` | grok 可执行文件路径 |
-| `WECHATBRIDGE_BACKEND` | `agy` | 全局默认后端（`agy` / `grok`，可被 `/backend` 按用户覆盖） |
+| `CODEX_BIN_PATH` | `codex` | codex 可执行文件路径 |
+| `WECHATBRIDGE_BACKEND` | `agy` | 全局默认后端（`agy` / `grok` / `codex`，可被 `/backend` 按用户覆盖） |
 | `WECHATBRIDGE_INSTANCE` | `default` | 实例名；state / 会话 / 二维码路径由它派生 |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _空_ | 允许使用的微信 ID，逗号分隔（空 = 全开） |
-| `AGY_TIMEOUT` | `600` | CLI 执行超时秒数（两个后端共用） |
+| `AGY_TIMEOUT` | `600` | CLI 执行超时秒数（三个后端共用） |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | 回传微信文件大小上限（100 MB） |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | 入站图片/文件下载后上限（20 MB） |
 | `WECHATBRIDGE_MAX_CONCURRENT` | `4` | 全局同时处理上限；同用户串行且排队不占全局槽；满了回「忙」 |
@@ -207,10 +217,10 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 | 指令 | 作用 |
 |---|---|
 | `/help` | 按当前后端列出支持指令 |
-| `/backend <agy\|grok>` | 按微信用户切换 CLI 后端（真切换时丢掉续聊标记；历史文件可能仍在，靠保留策略清理） |
+| `/backend <agy\|grok\|codex>` | 按微信用户切换 CLI 后端（真切换时清除该后端续聊状态——agy/grok 标记与 codex `thread_id`/resume——下次起新会话；历史文件可能仍在，靠保留策略清理） |
 | `/clear` 或 `/new` | 丢掉续聊标记，下次 CLI 起新对话（不会立刻删除历史文件） |
-| `/model <名称>` | 设模型（对照该后端模型列表校验；见 `/models`） |
-| `/models` | 列出当前 CLI 可用模型 |
+| `/model <名称>` | 设模型（校验因后端而异：agy/grok 对照实时模型列表校验；codex 只存名字不校验，填错会在下次运行时才报错） |
+| `/models` | 列出可用模型——agy/grok 向 CLI 实时查询；codex 返回内置参考列表，而非你账户实际可用的模型 |
 | `/fast` | 设为低推理开销（**只开不关**，不是来回切换） |
 | `/planning` | 设为 planning 模式（**只开不关**） |
 | `/add-dir <路径>` | **agy：** 校验通过后后续会带 `--add-dir`。**grok：** 只记偏好，暂不传给 CLI |
@@ -239,7 +249,8 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 
 ## 已知限制
 
-- 依赖 agy 和/或 grok，本身不是独立 agent。
+- 依赖 agy 和/或 grok 和/或 codex，本身不是独立 agent。
+- **codex** 后端尚未在真实 Codex 订阅/CLI 上实测，仅经源码研究、JSONL fixture 与 fake CLI 测试验证，暂视为社区测试，待真实用户确认。
 - 语音只靠微信转写；无本地 ASR；转写为空会提示改打字。
 - 不收发视频；不回原生语音气泡（未做 silk 编码）。
 - 一个进程绑一个微信号；多号多实例（`WECHATBRIDGE_INSTANCE`）。
