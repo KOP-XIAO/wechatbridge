@@ -15,7 +15,7 @@ import urllib.parse
 
 from .config import config
 from .runner_common import (
-    sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized,
+    sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
     format_error, format_cli_error, EMPTY_REPLY, validate_add_dir,
@@ -249,6 +249,33 @@ def _build_grok_command(prompt: str, prefs: dict, first: bool, persona_content: 
     return cmd
 
 
+def _has_grok_session(session_dir: str) -> bool:
+    """Check if a grok session exists for this cwd (for --continue safety).
+
+    grok --continue looks for the most recent session under
+    .grok/sessions/<url-encoded-cwd>/.  If that directory is empty or
+    missing, --continue will fail with "No session found".
+    """
+    grok_sessions = os.path.join(session_dir, ".grok", "sessions")
+    cwd_encoded = urllib.parse.quote(session_dir, safe="")
+    cwd_dir = os.path.join(grok_sessions, cwd_encoded)
+    if not os.path.isdir(cwd_dir):
+        return False
+    try:
+        for session_name in os.listdir(cwd_dir):
+            session_path = os.path.join(cwd_dir, session_name)
+            if os.path.isdir(session_path):
+                try:
+                    with os.scandir(session_path) as it:
+                        if any(it):
+                            return True
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Artifact extraction from chat_history.jsonl
 # ---------------------------------------------------------------------------
@@ -383,7 +410,18 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
     if is_dangerous(prompt):
         logger.warning("[AUDIT] dangerous keyword in prompt from user=%s", user_id)
 
-    first = is_first_message(session_dir)
+    first = is_first_message(session_dir, backend="grok")
+
+    # Safety: even if .initialized.grok exists, verify a real grok session
+    # is on disk.  Sessions can be cleaned by TTL or expire on the grok side
+    # while the flag remains, causing --continue to fail.
+    if not first and not _has_grok_session(session_dir):
+        logger.info(
+            "grok session missing despite .initialized.grok for %s, "
+            "treating as first message",
+            user_id,
+        )
+        first = True
     prefs = load_prefs(user_id)
     persona_content = _read_persona(session_dir)
     cmd = _build_grok_command(prompt, prefs, first, persona_content)
@@ -435,9 +473,65 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
                 raw_err = stderr_text or ("" if display == EMPTY_REPLY else display) or "process exited abnormally"
                 display = format_cli_error(raw_err, backend="grok")
 
+        # Fallback: if --continue failed because no session was found,
+        # retry once without --continue (fresh session).
+        if failed and not first:
+            raw_err_check = (stderr_text or (display if isinstance(display, str) else "") or "").lower()
+            if "no session found" in raw_err_check:
+                logger.warning(
+                    "grok --continue failed (no session) for %s, "
+                    "retrying without --continue",
+                    user_id,
+                )
+                clear_initialized(session_dir, backend="grok")
+                retry_cmd = _build_grok_command(prompt, prefs, True, persona_content)
+                retry_process = await asyncio.create_subprocess_exec(
+                    *retry_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=session_dir,
+                    env=env,
+                    preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+                )
+                try:
+                    r_stdout, r_stderr = await asyncio.wait_for(
+                        retry_process.communicate(),
+                        timeout=float(timeout),
+                    )
+                except asyncio.TimeoutError:
+                    await terminate_process(retry_process, graceful=True)
+                    return format_error("处理超时", f"超过 {timeout} 秒未完成，已终止本次任务。"), []
+                except (asyncio.CancelledError, Exception):
+                    await terminate_process(retry_process, graceful=False)
+                    raise
+
+                r_stdout_text = r_stdout.decode("utf-8", errors="replace").strip()
+                r_stderr_text = r_stderr.decode("utf-8", errors="replace").strip()
+                r_display, r_artifacts = _parse_grok_output(r_stdout_text, session_dir, since=t0)
+                r_failed = retry_process.returncode != 0 or (
+                    isinstance(r_display, str) and r_display.startswith("❌")
+                )
+                if retry_process.returncode != 0:
+                    logger.warning(
+                        "grok retry exited with code %s for user %s: %.200s",
+                        retry_process.returncode, user_id, r_stderr_text,
+                    )
+                    r_artifacts = []
+                    if not (isinstance(r_display, str) and r_display.startswith("❌")):
+                        raw_err = r_stderr_text or ("" if r_display == EMPTY_REPLY else r_display) or "process exited abnormally"
+                        r_display = format_cli_error(raw_err, backend="grok")
+                if not r_failed:
+                    mark_initialized(session_dir, backend="grok")
+                elapsed = time.time() - t0
+                logger.info(
+                    "grok retry done: user=%s elapsed=%.1fs artifacts=%d output=%d chars failed=%s",
+                    user_id, elapsed, len(r_artifacts), len(r_display), r_failed,
+                )
+                return r_display, r_artifacts
+
         # Only mark session initialized on a real successful reply
         if first and not failed:
-            mark_initialized(session_dir)
+            mark_initialized(session_dir, backend="grok")
 
         elapsed = time.time() - t0
         logger.info(
@@ -641,14 +735,8 @@ async def handle_grok_slash_command(text: str, user_id: str) -> str | None:
 
     if cmd in ("/clear", "/new"):
         session_dir = get_session_dir(user_id)
-        flag_path = os.path.join(session_dir, ".initialized")
-        try:
-            if os.path.exists(flag_path):
-                os.remove(flag_path)
-            return "✅ **对话已重置** ✅"
-        except OSError as e:
-            logger.error("Failed to clear session for %s: %s", user_id, e)
-            return "❌ **重置失败** ❌"
+        clear_initialized(session_dir, backend="grok")
+        return "✅ **对话已重置** ✅"
 
     if cmd == "/fast":
         update_active_prefs(user_id, effort="low")

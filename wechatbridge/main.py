@@ -20,6 +20,7 @@ from .config import config, ensure_runtime_dirs
 from .ilink import ILinkClient
 from .runner_common import (
     clean_session_media,
+    clear_initialized,
     format_error,
     format_model_label,
     format_oversized_artifact_notice,
@@ -196,9 +197,7 @@ def _cmd_backend(args: str, user_id: str) -> str:
     # Reset session so new backend starts fresh (only when actually changed)
     if old != new:
         session_dir = get_session_dir(user_id)
-        flag = os.path.join(session_dir, ".initialized")
-        if os.path.exists(flag):
-            os.remove(flag)
+        clear_initialized(session_dir, backend=new)
         return (
             f"✅ **助手引擎已切换** ✅\n\n"
             f"`{old}` → `{new}`\n"

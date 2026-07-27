@@ -14,7 +14,7 @@ import time
 
 from .config import config
 from .runner_common import (
-    sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized,
+    sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
     format_error, format_cli_error, EMPTY_REPLY,
@@ -130,7 +130,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
             "[AUDIT] dangerous keyword in prompt from user=%s", user_id
         )
 
-    first = is_first_message(session_dir)
+    first = is_first_message(session_dir, backend="agy")
 
     # Build command: agy [--model X] [--effort Y] [--mode Z] [--add-dir W ...] [-c] -p <prompt>
     # --dangerously-skip-permissions 保留：可信小圈子用户需 agy 能自动调工具，风险由服务层(root)+输入来源(可信用户)承担
@@ -266,7 +266,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                         r_display = clean_output(r_stdout_text) or EMPTY_REPLY
                         r_display = re.sub(r"\[([^\]]+)\]\(file:///[^)]+\)", r"[\1]", r_display)
                         if first and r_display != EMPTY_REPLY and not r_display.startswith("❌"):
-                            mark_initialized(session_dir)
+                            mark_initialized(session_dir, backend="agy")
                         return r_display, r_artifacts
                     return format_error(
                         "模型响应超时",
@@ -279,7 +279,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
 
         # Success path only
         if first and display != EMPTY_REPLY:
-            mark_initialized(session_dir)
+            mark_initialized(session_dir, backend="agy")
 
         elapsed = time.time() - t0
         logger.info(
@@ -489,14 +489,8 @@ def handle_persona(args: str, user_id: str) -> str:
 def _cmd_clear(user_id: str) -> str:
     """Handle /clear or /new: delete .initialized flag to start fresh."""
     session_dir = get_session_dir(user_id)
-    flag_path = os.path.join(session_dir, ".initialized")
-    try:
-        if os.path.exists(flag_path):
-            os.remove(flag_path)
-        return "✅ **对话已重置** ✅"
-    except OSError as e:
-        logger.error("Failed to clear session for %s: %s", user_id, e)
-        return "❌ **重置失败** ❌"
+    clear_initialized(session_dir, backend="agy")
+    return "✅ **对话已重置** ✅"
 
 
 def _cmd_fast(user_id: str) -> str:

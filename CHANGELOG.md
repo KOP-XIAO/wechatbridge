@@ -5,6 +5,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.3.5] - 2026-07-27
+
+### Fixed
+
+- **grok `--continue` 报 "这次没处理好"**：`.initialized` 标记改为按后端隔离（`.initialized.grok` / `.initialized.agy`），防止跨后端污染。加 `--continue` 前运行时检查 grok session 是否真实存在；若 `--continue` 因无 session 失败，自动降级为新会话重试。`_clear_initialized_if_no_history` 同步改为按后端分别清理。
+
 ## [1.3.4] - 2026-07-27
 
 ### Fixed
