@@ -96,7 +96,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - Artifact send uses `realpath` so symlinks cannot escape the allowed root.
 - Inbound media size cap (`WECHATBRIDGE_MAX_INBOUND_BYTES`, default 20MB); CDN download URL host allowlist.
 - Inbound CDN download is **streamed** and aborts as soon as the size cap is exceeded (no full-body buffer when Content-Length is missing).
-- Global concurrency limit (`WECHATBRIDGE_MAX_CONCURRENT`, default 4) with busy reply when full.
+- Global concurrency limit (`WECHATBRIDGE_MAX_CONCURRENT`, default 4) with busy reply when full. Same user is serialized first so queue wait does not occupy a global slot (one slot per user while processing).
 - Session dirs and runtime data dirs created as `0700`; QR/state files `0600`.
 
 ### Fixed

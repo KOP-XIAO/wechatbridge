@@ -117,7 +117,7 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         logger.warning("Prompt too large for argv from user %s", user_id)
         return format_error(
             "消息过长",
-            f"单条消息超过 {_MAX_ARG_BYTES // 1024}KB 无法传给 CLI，请精简或分段发送。",
+            f"这条消息太长了（超过 {_MAX_ARG_BYTES // 1024}KB），请精简或分段发送。",
         ), []
 
     t0 = time.time()
@@ -252,8 +252,8 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                         )
                         await terminate_process(retry_process, graceful=True)
                         return format_error(
-                            "级联超时",
-                            "模型 API 级联推理超时，自动重试仍超时。请稍后重试或简化指令。",
+                            "模型响应超时",
+                            "模型响应超时，自动重试仍超时。请稍后重试或简化指令。",
                         ), []
                     except (asyncio.CancelledError, Exception):
                         await terminate_process(retry_process, graceful=False)
@@ -269,12 +269,12 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                             mark_initialized(session_dir)
                         return r_display, r_artifacts
                     return format_error(
-                        "级联超时",
-                        "模型 API 级联推理超时，自动重试仍失败。请稍后重试或简化指令。",
+                        "模型响应超时",
+                        "模型响应超时，自动重试仍失败。请稍后重试或简化指令。",
                     ), []
                 return format_cli_error(stderr_text, backend="agy"), []
             # Non-zero exit: never treat raw stdout as a normal success reply
-            raw = stderr_text or stdout_text or display or "agy 进程异常退出"
+            raw = stderr_text or stdout_text or display or "process exited abnormally"
             return format_cli_error(raw, backend="agy"), []
 
         # Success path only
@@ -305,7 +305,10 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
     except Exception as e:
         logger.exception("Unexpected error running agy: %s", e)
         await terminate_process(process, graceful=False)
-        return format_error("执行出错", "内部错误，详情见服务端日志。"), []
+        return format_error(
+            "执行出错",
+            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+        ), []
 
 
 # ---------------------------------------------------------------------------
@@ -352,16 +355,19 @@ async def _run_agy_subcommand(subcmd_args: list, user_id: str) -> str:
         return clean_output(stdout_text) or EMPTY_REPLY
 
     except asyncio.TimeoutError:
-        # 超时必须回收子进程，否则挂死的子命令成为孤儿进程
+        # 超时必须回收子进程，否则挂死的查询进程成为孤儿
         await terminate_process(process, graceful=True)
-        return format_error("指令超时", "子命令 30 秒内未完成。")
+        return format_error("查询超时", "查询超时，请稍后再试。")
     except asyncio.CancelledError:
         await terminate_process(process, graceful=False)
         raise
     except Exception as e:
         logger.exception("Subcommand error: %s", e)
         await terminate_process(process, graceful=False)
-        return format_error("执行出错", "内部错误，详情见服务端日志。")
+        return format_error(
+            "执行出错",
+            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+        )
 
 
 def _cmd_help() -> str:
@@ -372,28 +378,28 @@ def _cmd_help() -> str:
         "**模型控制**",
         "- `/model <名称>` — 切换模型（用 `/models` 查看可用列表）",
         "- `/models` — 查看可用模型列表",
-        "- `/backend <agy|grok>` — 切换后端 CLI",
+        "- `/backend <agy|grok>` — 切换助手引擎",
         "",
         "**对话控制**",
         "- `/clear` 或 `/new` — 重置对话（开始新会话）",
-        "- `/fast` — 开启**快速模式**（低推理开销）",
-        "- `/planning` — 开启 **planning 模式**",
+        "- `/fast` — 开启**快速模式**（回答更快，思考更少）",
+        "- `/planning` — 开启**规划模式**（先想清楚再动手）",
         "",
         "**工具**",
         "- `/add-dir <路径>` — 添加工作目录",
-        "- `/agents` — 查看可用 agent",
+        "- `/agents` — 查看可用助手",
         "",
-        "**MCP & 子代理**",
-        "- `/mcp` — MCP 工具使用引导",
-        "- `/agent <名称> <任务>` — 调用子代理执行任务",
+        "**扩展工具 & 子助手**",
+        "- `/mcp` — 扩展工具使用说明",
+        "- `/agent <名称> <任务>` — 调用子助手执行任务",
         "",
         "**人格**",
-        "- `/persona <内容>` — 设置你专属的人格文档（支持 show / clear / reset 子命令）",
+        "- `/persona <内容>` — 设置你专属的人格文档（另有 show / clear / reset）",
         "",
         "**其他**",
         "- `/help` — 显示本帮助",
         "",
-        "提示：其他 `/` 指令（如 `/goal`、`/grill-me`、`/schedule` 等）会直接交给 agy 处理。",
+        "提示：其他 `/` 指令（如 `/goal`、`/grill-me`、`/schedule` 等）会直接交给助手处理。",
     ]
     return "\n".join(lines)
 
@@ -496,13 +502,13 @@ def _cmd_clear(user_id: str) -> str:
 def _cmd_fast(user_id: str) -> str:
     """Handle /fast: set effort=low (scoped to current backend)."""
     update_active_prefs(user_id, effort="low")
-    return "✅ **已开启 fast 模式** ✅"
+    return "✅ **已开启快速模式** ✅"
 
 
 def _cmd_planning(user_id: str) -> str:
     """Handle /planning: set mode=plan (scoped to current backend)."""
     update_active_prefs(user_id, mode="plan")
-    return "✅ **已开启 planning 模式** ✅"
+    return "✅ **已开启规划模式** ✅"
 
 
 def _cmd_add_dir(args: str, user_id: str) -> str:
@@ -627,8 +633,9 @@ async def handle_slash_command(text: str, user_id: str) -> str | None:
 
     if cmd == "/agents":
         output = await _run_agy_subcommand(["agents"], user_id)
-        if not output or output == "Available agents:":
-            output = "**Available agents**\n\n（当前没有自定义 agent。）"
+        # Match CLI empty output; rewrite user-facing wording only
+        if not output or output.strip() in ("Available agents:", "Available agents"):
+            output = "**可用助手**\n\n（当前没有自定义助手。）"
         return output
 
     if cmd == "/models":
@@ -642,12 +649,11 @@ async def handle_slash_command(text: str, user_id: str) -> str | None:
         if not config.enable_mcp:
             return "ℹ️ **该功能已禁用** ℹ️"
         return (
-            "ℹ️ **MCP 工具使用引导** ℹ️\n\n"
-            "agy 已配置 MCP server（ctxmode / codegraph）。\n\n"
-            "使用方法：用自然语言描述调用，格式为：\n"
-            "> 用 call_mcp_tool 调用 `<工具名>`，参数 `<json>`\n\n"
+            "ℹ️ **扩展工具说明** ℹ️\n\n"
+            "可以直接用自然语言让助手调用已配置的扩展工具（如代码检索等）。\n\n"
             "示例：\n"
-            "> 用 codegraph 的 search 工具搜 ctxmode"
+            "> 用 codegraph 的 search 搜一下 ctxmode\n"
+            "> 帮我查一下这个项目里 xxx 怎么实现的"
         )
 
     # /agent 已上移到 main.py 统一处理（必须经过危险确认门，不能再绕过）

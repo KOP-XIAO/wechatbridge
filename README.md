@@ -124,7 +124,7 @@ Key variables (all have defaults):
 | `AGY_TIMEOUT` | `600` | CLI run timeout in seconds (both backends) |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | max file size sent back to WeChat (100 MB) |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | max inbound image/file after download (20 MB) |
-| `WECHATBRIDGE_MAX_CONCURRENT` | `4` | global concurrent handlers; extras get a busy reply |
+| `WECHATBRIDGE_MAX_CONCURRENT` | `4` | global concurrent process slots; same user serial (queue does not hold a slot); extras get a busy reply |
 | `WECHATBRIDGE_CONFIRM_TOKEN` | `y` | reply this token to approve a gated dangerous prompt |
 | `WECHATBRIDGE_ENABLE_MCP` | `true` | enable the `/mcp` help text command |
 | `WECHATBRIDGE_ENABLE_SUBAGENT` | `true` | enable the `/agent` prompt-rewrite command |
@@ -231,7 +231,7 @@ Other `/…` commands are either rejected (e.g. `/exit`), reported as unsupporte
 - **Danger gate is keyword-based**, not full intent understanding. Defaults target concrete patterns (`rm -rf /`, pipe-to-shell, `mkfs`, `format c:`, a few heavy Chinese phrases, …). Everyday wording like bare “delete” is **not** gated. Override list via `WECHATBRIDGE_CONFIRM_KEYWORDS`; approve with `WECHATBRIDGE_CONFIRM_TOKEN` (default `y`), TTL `WECHATBRIDGE_PENDING_TTL`.
 - **Inbound media** is size-capped (default 20 MB), streamed, and CDN hosts are allowlisted. Missing `aes_key` returns a clear error.
 - **Outbound artifacts** only leave the allowed per-user tree (agy: session scratch; grok: under session dir), after `realpath` checks, and only if under `WECHATBRIDGE_MAX_OUTBOUND_BYTES`.
-- **Concurrency:** global cap (`WECHATBRIDGE_MAX_CONCURRENT`, default 4); same user is serialized, different users can run in parallel.
+- **Concurrency:** global process-slot cap (`WECHATBRIDGE_MAX_CONCURRENT`, default 4). Same user is serialized and does **not** hold a global slot while waiting on their previous message; different users can run in parallel up to the cap.
 - **Long replies** are split into chunks (`WECHATBRIDGE_MESSAGE_CHUNK`, default 2000 characters).
 - **Data layout:** instance data under `~/.local/share/wechatbridge/<instance>/` (override with env). Runtime dirs prefer `0700`; token/QR files prefer `0600` (Unix; Windows relies on NTFS ACLs).
 - **Retention:** session temps vs dialogue history use separate TTLs (`WECHATBRIDGE_SESSION_RETENTION_DAYS`, `WECHATBRIDGE_HISTORY_RETENTION_DAYS`). Prefs/auth are kept.

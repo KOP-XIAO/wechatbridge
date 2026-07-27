@@ -158,7 +158,7 @@ async def _handle_slash(client: ILinkClient, text: str, user_id: str, context_to
     if cmd == "/version":
         return (
             f"📦 **版本信息** 📦\n\n当前版本: `{__version__}`\n"
-            f"实例: `{config.instance}`  后端: `{_get_backend(user_id)}`"
+            f"实例: `{config.instance}`  引擎: `{_get_backend(user_id)}`"
         ) + format_update_hint()
 
     backend = _get_backend(user_id)
@@ -183,12 +183,12 @@ def _cmd_backend(args: str, user_id: str) -> str:
         current = prefs.get("backend", config.backend)
         model_label = format_model_label(prefs.get("model", ""))
         return (
-            f"📋 **当前后端** 📋\n\n`{current}`\n"
+            f"📋 **当前助手引擎** 📋\n\n`{current}`\n"
             f"模型: `{model_label}`\n\n"
             "用法: `/backend agy` 或 `/backend grok`"
         )
     if name not in ("agy", "grok"):
-        return "❌ **未知后端** ❌\n\n支持: `agy` / `grok`\n\n`/backend agy` 或 `/backend grok`"
+        return "❌ **未知引擎** ❌\n\n支持: `agy` / `grok`\n\n`/backend agy` 或 `/backend grok`"
     prefs = load_prefs(user_id)
     old, new = switch_backend_prefs(prefs, name)
     save_prefs(user_id, prefs)
@@ -200,19 +200,19 @@ def _cmd_backend(args: str, user_id: str) -> str:
         if os.path.exists(flag):
             os.remove(flag)
         return (
-            f"✅ **后端已切换** ✅\n\n"
+            f"✅ **助手引擎已切换** ✅\n\n"
             f"`{old}` → `{new}`\n"
             f"模型: `{model_label}`\n\n"
-            "⚠️ 对话已重置，新后端将开始新会话。"
+            "⚠️ 对话已重置，新引擎将开始新会话。"
         )
     return (
-        f"📋 **当前后端** 📋\n\n`{name}`（未变化）\n"
+        f"📋 **当前助手引擎** 📋\n\n`{name}`（未变化）\n"
         f"模型: `{model_label}`"
     )
 
 
 async def _cmd_agent(client: ILinkClient, args: str, user_id: str, context_token: str):
-    """Handle /agent <名称> <任务> — 调用子代理执行任务。
+    """Handle /agent <名称> <任务> — 调用子助手执行任务。
 
     必须经过 gate_and_run 的危险确认门（历史上后端各自实现时绕过了该检查）。
     """
@@ -223,9 +223,18 @@ async def _cmd_agent(client: ILinkClient, args: str, user_id: str, context_token
     agent_parts = args.split(maxsplit=1)
     agent_name = agent_parts[0]
     agent_task = agent_parts[1] if len(agent_parts) > 1 else ""
+    # Execution path still uses the invoke_subagent wording for the backend;
+    # confirmation UI shows the user's original agent/task only.
     crafted = f"请用 invoke_subagent 调用 agent {agent_name} 执行任务：{agent_task}"
+    display = (
+        f"调用助手「{agent_name}」执行：{agent_task}"
+        if agent_task
+        else f"调用助手「{agent_name}」"
+    )
     logger.info("Agent subcmd: user=%s agent=%s task=%.100s", user_id, agent_name, agent_task)
-    result = await gate_and_run(client, user_id, context_token, crafted)
+    result = await gate_and_run(
+        client, user_id, context_token, crafted, display_prompt=display,
+    )
     if result is None:
         return _HANDLED  # 已进入危险确认流程
     return result  # (reply, artifacts)
@@ -326,10 +335,20 @@ async def login_flow(client: ILinkClient) -> bool:
         return False
 
 
-async def gate_and_run(client, from_user, context_token, prompt) -> tuple[str, list] | None:
+async def gate_and_run(
+    client,
+    from_user,
+    context_token,
+    prompt,
+    *,
+    display_prompt: str | None = None,
+) -> tuple[str, list] | None:
     """Check prompt with is_dangerous; if dangerous, ask for confirmation.
 
     Returns (reply, artifacts) on safe prompt, None if confirmation asked.
+
+    ``display_prompt`` (optional) is what the user sees in the confirm bubble;
+    the stored/executed prompt remains ``prompt`` (execution path unchanged).
     """
     if is_dangerous(prompt):
         expire_at = time.time() + config.pending_confirm_ttl
@@ -338,10 +357,11 @@ async def gate_and_run(client, from_user, context_token, prompt) -> tuple[str, l
             "expire_at": expire_at,
             "context_token": context_token,
         }
+        shown = display_prompt if display_prompt is not None else prompt
         await client.send_message(
             to_user_id=from_user,
             text=(
-                f"⚠️ **危险操作确认** ⚠️\n\n```\n{prompt}\n```\n\n"
+                f"⚠️ **危险操作确认** ⚠️\n\n```\n{shown}\n```\n\n"
                 f"- 回复 **{config.confirm_token}** → 执行\n"
                 f"- 回复其他 → 取消"
             ),
@@ -537,7 +557,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
     reply = ""
     if image_media:
         if not image_media.get("aes_key"):
-            reply = format_error("图片无法处理", "缺少解密密钥，请重新发送图片。")
+            reply = format_error("图片处理失败", "图片信息不完整，请重新发。")
             logger.warning("图片缺少 aes_key from=%s", from_user)
         else:
             try:
@@ -572,15 +592,21 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
                 reply, artifacts = result
 
             except Exception as e:
+                # ilink 细节（aes_key / CDN / 字节数等）只写日志，不直出给用户
                 logger.exception("图片下载/解密失败: %s", e)
-                # ValueError 是自定义的中文可读原因；其他异常（httpx 等）含内部 URL，不外发
-                detail = str(e) if isinstance(e, ValueError) else "请重新发送图片。"
-                reply = format_error("图片下载或解密失败", detail)
+                err_s = str(e)
+                if isinstance(e, ValueError) and "过大" in err_s:
+                    reply = format_error(
+                        "文件太大了",
+                        "图片太大，发不进来。请压缩后再发，或换成更小的图。",
+                    )
+                else:
+                    reply = format_error("图片处理失败", "图片没处理好，请重新发。")
 
     # ---- Case 1.5: Message contains a file (non-image) ----
     elif file_media:
         if not file_media.get("aes_key"):
-            reply = format_error("文件无法处理", "缺少解密密钥，请重新发送文件。")
+            reply = format_error("文件处理失败", "文件信息不完整，请重新发。")
             logger.warning("文件缺少 aes_key from=%s", from_user)
         else:
             try:
@@ -612,10 +638,16 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
                 reply, artifacts = result
 
             except Exception as e:
+                # ilink 细节（aes_key / CDN / 字节数等）只写日志，不直出给用户
                 logger.exception("文件下载/解密失败: %s", e)
-                # ValueError 是自定义的中文可读原因；其他异常（httpx 等）含内部 URL，不外发
-                detail = str(e) if isinstance(e, ValueError) else "请重新发送文件。"
-                reply = format_error("文件下载或解密失败", detail)
+                err_s = str(e)
+                if isinstance(e, ValueError) and "过大" in err_s:
+                    reply = format_error(
+                        "文件太大了",
+                        "文件太大，发不进来。请压缩后再发，或换成更小的文件。",
+                    )
+                else:
+                    reply = format_error("文件处理失败", "文件没处理好，请重新发。")
 
     # ---- Case 1.6: Voice message (text transcription passthrough) ----
     elif has_voice:
@@ -627,7 +659,7 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
             reply, artifacts = result
         else:
             # WeChat failed to transcribe the voice → ask user to type.
-            reply = "🤔 **听不清，请打字** 🤔"
+            reply = "🤔 **没听清语音** 🤔\n\n请改成打字发。"
             logger.info("语音未识别出文字 from=%s", from_user)
 
     # ---- Case 2: Text-only message (original logic) ----
@@ -849,43 +881,56 @@ def _prune_user_locks() -> None:
 
 
 async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
-    """Run process_message inside global concurrency + per-user locks.
+    """Run process_message with per-user serial queue then global concurrency.
 
-    This ensures the main get_updates long-polling loop is NEVER blocked,
-    keeping WeChat heartbeats 100% active while ensuring per-user message ordering.
+    Order matters:
+      1) Take per-user lock first — same-user messages queue here and do NOT
+         hold a global slot while waiting for the previous one.
+      2) Acquire global semaphore only immediately before process_message.
+      3) Fail-fast (short timeout) if global slots are full; release only if held.
+
+    Thus one user can occupy at most one global slot at a time; cross-user
+    parallelism is still capped by WECHATBRIDGE_MAX_CONCURRENT.
     """
     from_user = msg.get("from_user_id", "")
     context_token = msg.get("context_token", "")
     sem = _get_global_sem()
+    sem_held = False
 
-    # Fail fast when all slots are busy (do not queue unbounded work)
-    try:
-        await asyncio.wait_for(sem.acquire(), timeout=0.05)
-    except asyncio.TimeoutError:
-        logger.warning("并发已满，拒绝处理 from=%s", from_user)
-        if context_token and from_user:
-            try:
-                await client.send_message(
-                    to_user_id=from_user,
-                    text="⏳ **系统繁忙** ⏳\n\n当前处理人数已满，请稍后再试。",
-                    context_token=context_token,
-                    baseurl=client.state.baseurl,
-                    bot_token=client.state.bot_token,
-                )
-            except Exception as e:
-                logger.warning("发送繁忙提示失败: %s", e)
-        return
+    # Serialize same user first (empty from_user still gets a dedicated lock key)
+    if from_user not in user_locks:
+        user_locks[from_user] = asyncio.Lock()
 
-    try:
-        if from_user not in user_locks:
-            user_locks[from_user] = asyncio.Lock()
-        async with user_locks[from_user]:
-            try:
-                await process_message(client, msg)
-            except Exception as e:
-                logger.exception("处理消息异常 (from=%s): %s", from_user, e)
-    finally:
-        sem.release()
+    async with user_locks[from_user]:
+        # Global slot only after we own the user lock
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=0.05)
+            sem_held = True
+        except asyncio.TimeoutError:
+            logger.warning("并发已满，拒绝处理 from=%s", from_user)
+            if context_token and from_user:
+                try:
+                    await client.send_message(
+                        to_user_id=from_user,
+                        text=(
+                            "⏳ **现在有点忙** ⏳\n\n"
+                            "同时处理的消息太多，请过几秒再发。"
+                        ),
+                        context_token=context_token,
+                        baseurl=client.state.baseurl,
+                        bot_token=client.state.bot_token,
+                    )
+                except Exception as e:
+                    logger.warning("发送繁忙提示失败: %s", e)
+            return
+
+        try:
+            await process_message(client, msg)
+        except Exception as e:
+            logger.exception("处理消息异常 (from=%s): %s", from_user, e)
+        finally:
+            if sem_held:
+                sem.release()
 
 
 # ---------------------------------------------------------------------------

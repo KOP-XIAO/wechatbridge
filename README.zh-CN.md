@@ -23,7 +23,7 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 - slash 指令：模型、清会话、人格等（见下表）
 - 危险提示闸门：对**明确破坏性关键词/模式**先确认再跑（不是全语义理解）
 - 白名单 `WECHATBRIDGE_ALLOWED_SENDERS`（空 = 全开）
-- `/mcp` 只回使用说明；`/agent` 改写成自然语言子代理提示再交给 CLI（**不是**桥内原生 MCP 协议）
+- `/mcp` 只回使用说明；`/agent` 改写成自然语言子助手提示再交给当前引擎（**不是**桥内原生扩展协议）
 - 媒体走微信 CDN，AES-128-ECB 加解密
 - 多实例：一套代码，用 `WECHATBRIDGE_INSTANCE` 区分进程（state / 会话 / 二维码路径由实例名派生）
 - 部署模板：Linux systemd、macOS launchd、Windows 任务计划说明
@@ -124,7 +124,7 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 | `AGY_TIMEOUT` | `600` | CLI 执行超时秒数（两个后端共用） |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | 回传微信文件大小上限（100 MB） |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | 入站图片/文件下载后上限（20 MB） |
-| `WECHATBRIDGE_MAX_CONCURRENT` | `4` | 全局并发处理数；超出回「忙」 |
+| `WECHATBRIDGE_MAX_CONCURRENT` | `4` | 全局同时处理上限；同用户串行且排队不占全局槽；满了回「忙」 |
 | `WECHATBRIDGE_CONFIRM_TOKEN` | `y` | 危险闸门确认口令 |
 | `WECHATBRIDGE_ENABLE_MCP` | `true` | 是否启用 `/mcp` 说明指令 |
 | `WECHATBRIDGE_ENABLE_SUBAGENT` | `true` | 是否启用 `/agent` 提示改写指令 |
@@ -214,11 +214,11 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 | `/fast` | 设为低推理开销（**只开不关**，不是来回切换） |
 | `/planning` | 设为 planning 模式（**只开不关**） |
 | `/add-dir <路径>` | **agy：** 校验通过后后续会带 `--add-dir`。**grok：** 只记偏好，暂不传给 CLI |
-| `/agents` | 通过当前 CLI 列 agent |
+| `/agents` | 列出可用助手 |
 | `/persona <内容>` | 设人格（`show` / `clear` / `reset`） |
 | `/version` | 显示当前版本、实例名和后端；若有新版本则显示升级提示 |
 | `/mcp` | 短 **使用说明** 文案（可用 `WECHATBRIDGE_ENABLE_MCP` 关掉） |
-| `/agent <名称> <任务>` | 拼成「调用子代理…」提示再跑 CLI（可用 `WECHATBRIDGE_ENABLE_SUBAGENT` 关掉） |
+| `/agent <名称> <任务>` | 拼成「调用子助手…」提示再跑当前引擎（可用 `WECHATBRIDGE_ENABLE_SUBAGENT` 关掉） |
 
 其余 `/…`：有的在微信端禁用（如 `/exit`），有的是 TUI 专用会提示不支持，其余透传给当前 CLI。
 
@@ -231,7 +231,7 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 - **危险闸门是关键词匹配**，不是完整意图识别。默认针对具体模式（如 `rm -rf /`、管道进 shell、`mkfs`、`format c:`、少量重型中文句式等）。日常里单独一个「删除」**不会**拦。可用 `WECHATBRIDGE_CONFIRM_KEYWORDS` 自定义；确认口令 `WECHATBRIDGE_CONFIRM_TOKEN`（默认 `y`），等待 `WECHATBRIDGE_PENDING_TTL`。
 - **入站媒体**有大小上限（默认 20 MB）、流式下载、CDN 域名白名单；缺 `aes_key` 会明确报错。
 - **出站产物**只从用户允许目录发出（agy：会话 scratch；grok：会话目录下），经 `realpath` 检查，且不超过 `WECHATBRIDGE_MAX_OUTBOUND_BYTES`。
-- **并发：** 全局上限默认 4；同一用户串行，不同用户可并行。
+- **并发：** 全局同时处理上限默认 4。同一用户串行，排队等自己上一条时**不占**全局槽；不同用户可并行，受全局上限约束。
 - **长回复**按字数切块（`WECHATBRIDGE_MESSAGE_CHUNK`，默认 2000）。
 - **数据目录：** 默认 `~/.local/share/wechatbridge/<instance>/`（可 env 覆盖）。运行目录倾向 `0700`，token/二维码倾向 `0600`（Unix；Windows 依赖 NTFS ACL）。
 - **清理：** 会话临时文件与对话历史用不同 TTL（`WECHATBRIDGE_SESSION_RETENTION_DAYS`、`WECHATBRIDGE_HISTORY_RETENTION_DAYS`）。偏好/登录信息不按此删。

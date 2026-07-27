@@ -113,8 +113,8 @@ def validate_add_dir(path: str, user_id: str) -> tuple[bool, str]:
     if not any(path_is_under(resolved, root) for root in allowed_roots):
         return False, (
             "路径不在允许范围内。"
-            "仅允许会话目录"
-            + (" 或 WECHATBRIDGE_ADD_DIR_ROOTS 内路径" if config.add_dir_roots else "")
+            "仅允许你的工作区"
+            + (" 或管理员已开放的目录" if config.add_dir_roots else "")
             + "。"
         )
     return True, resolved
@@ -151,8 +151,8 @@ def clean_output(text: str) -> str:
 # WeChat error reply format (fixed header + body)
 # ---------------------------------------------------------------------------
 
-# Shown when CLI returns successfully but with no display text
-EMPTY_REPLY = "（无回复内容）"
+# Shown when backend returns successfully but with no display text
+EMPTY_REPLY = "（这次没有文字回复）"
 
 
 def format_error(title: str, detail: str = "") -> str:
@@ -161,7 +161,7 @@ def format_error(title: str, detail: str = "") -> str:
     Example:
         ❌ **未登录** ❌
 
-        Grok 凭证不可用。
+        助手尚未登录，请联系管理员。
     """
     title = (title or "错误").strip().replace("\n", " ")
     detail = (detail or "").strip()
@@ -179,29 +179,26 @@ def format_oversized_artifact_notice(art_name: str, size_mb: float) -> str:
     return (
         f"⚠️ **文件过大** ⚠️\n\n"
         f"`{name}` {float(size_mb):.1f} MB\n"
-        f"已保存在服务器会话目录，未回传微信。"
+        f"文件已生成，但太大无法发到微信。请联系管理员获取，或让我改小后再试。"
     )
 
 
 def format_cli_error(raw_message: str, *, backend: str = "") -> str:
-    """Map CLI stderr/JSON error text into Chinese title + fixed header.
+    """Map backend stderr/JSON error text into a short Chinese user reply.
 
-    Never put the whole raw English blob into the ❌ **...** ❌ title line.
-    Known cases get a Chinese title + short Chinese explanation; raw text
-    is kept under「原始信息」only when it is not already Chinese-heavy.
+    Never put English raw blobs or internal path/env names into user text.
+    Details stay in the server log only.
     """
     raw = clean_output(raw_message or "") or "未知错误"
     lower = raw.lower()
     backend = (backend or "").strip().lower()
-    name = "Grok" if backend == "grok" else ("agy" if backend == "agy" else "CLI")
+    logger.info(
+        "format_cli_error backend=%s raw=%.300s",
+        backend or "?",
+        raw,
+    )
 
-    def _with_raw(title: str, zh: str) -> str:
-        # Avoid duplicating if raw is already the zh line
-        if raw.strip() == zh.strip():
-            return format_error(title, zh)
-        return format_error(title, f"{zh}\n\n原始信息：\n{raw}")
-
-    # Auth / login
+    # Auth / login — ops details stay in logs; users contact admin
     if (
         "not signed in" in lower
         or "authenticate" in lower
@@ -213,11 +210,11 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
         or "unauthorized" in lower
         or "401" in lower and ("auth" in lower or "token" in lower or "login" in lower)
         or ("xai_api_key" in lower and ("sign" in lower or "login" in lower or "auth" in lower))
+        or "api_key" in lower and ("missing" in lower or "invalid" in lower or "required" in lower)
     ):
-        return _with_raw(
+        return format_error(
             "未登录",
-            f"{name} 未登录，或读不到有效凭证。"
-            + (" 请在本机执行 `grok login --device-code`，或设置 `XAI_API_KEY`。" if backend == "grok" else " 请检查本机登录/凭证是否有效。"),
+            "助手尚未登录或凭证失效，请联系管理员处理。",
         )
 
     # Rate limit / quota
@@ -229,7 +226,10 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
         or "resource exhausted" in lower
         or "429" in lower
     ):
-        return _with_raw("请求过于频繁", "触发限流或额度不足，请稍后再试。")
+        return format_error(
+            "请求过于频繁",
+            "用得有点多，暂时被限制了，请稍后再试。",
+        )
 
     # Network
     if (
@@ -244,17 +244,20 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
         or "fetch failed" in lower
         or "socket hang up" in lower
     ):
-        return _with_raw("网络错误", "连不上服务，请检查网络后重试。")
+        return format_error("网络错误", "连不上服务，请检查网络后重试。")
 
-    # Cascade / API hang (agy)
+    # Cascade / API hang (agy) — plain language for users
     if "timeout waiting for cascade" in lower or "timeout waiting for response" in lower:
-        return _with_raw("级联超时", "模型 API 级联推理超时，请稍后重试或简化指令。")
+        return format_error(
+            "模型响应超时",
+            "模型响应超时，请稍后重试或简化指令。",
+        )
 
     if "permission" in lower and ("denied" in lower or "refuse" in lower or "rejected" in lower):
-        return _with_raw("权限不足", "没有执行该操作的权限。")
+        return format_error("权限不足", "没有执行该操作的权限。")
 
     if "timeout" in lower or "timed out" in lower or "deadline exceeded" in lower:
-        return _with_raw("超时", "等待响应超时，请稍后重试。")
+        return format_error("超时", "等待响应超时，请稍后重试。")
 
     if "model" in lower and (
         "not found" in lower
@@ -265,21 +268,19 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
         or "not supported" in lower
         or "no such" in lower
     ):
-        return _with_raw("模型无效", "指定的模型不可用，请用 `/models` 查看后重选。")
+        return format_error("模型无效", "指定的模型不可用，请用 `/models` 查看后重选。")
 
     if "command not found" in lower or "not a command" in lower:
-        return _with_raw("命令不可用", f"{name} 可执行文件可能未安装或不在 PATH 中。")
+        return format_error(
+            "助手不可用",
+            "助手程序未正确安装或配置，请联系管理员。",
+        )
 
     if "not found" in lower or "no such file" in lower or "enoent" in lower:
-        return _with_raw("未找到", "请求的资源或文件不存在。")
+        return format_error("未找到", "请求的资源或文件不存在。")
 
-    # Generic CLI failure — short Chinese title, body is raw (may still be English)
-    title = "执行失败"
-    if backend == "grok":
-        title = "Grok 执行失败"
-    elif backend == "agy":
-        title = "agy 执行失败"
-    return format_error(title, raw)
+    # Unknown: fixed Chinese only — never echo English raw to WeChat users
+    return format_error("执行失败", "这次没处理好，请稍后再试。")
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +455,7 @@ def format_model_label(model: str) -> str:
     """Human-readable model for switch replies."""
     model = (model or "").strip()
     if not model:
-        return "后端默认（未指定）"
+        return "默认（未指定）"
     return model
 
 

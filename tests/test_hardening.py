@@ -145,7 +145,7 @@ class TestOversizedArtifactNotice(unittest.TestCase):
         self.assertNotIn("/root/", text)
         self.assertNotIn("sessions/", text)
         self.assertIn("report.pdf", text)
-        self.assertIn("未回传", text)
+        self.assertIn("无法发到微信", text)
 
     def test_send_artifacts_back_uses_safe_notice(self):
         """Call the real async helper; assert user text has no server path."""
@@ -187,7 +187,7 @@ class TestOversizedArtifactNotice(unittest.TestCase):
                 self.assertNotIn(big_path, text)
                 self.assertNotIn(td, text)
                 self.assertIn("huge.bin", text)
-                self.assertIn("未回传", text)
+                self.assertIn("无法发到微信", text)
 
         asyncio.run(_run())
 

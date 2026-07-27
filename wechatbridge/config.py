@@ -191,7 +191,8 @@ class AppConfig:
     # Maximum inbound image/file size after download (bytes) — default 20 MB
     max_inbound_file_bytes: int = _env_int("WECHATBRIDGE_MAX_INBOUND_BYTES", 20 * 1024 * 1024)
 
-    # Max concurrent message handlers (global). Extra messages get a busy reply.
+    # Global concurrent process_message slots. Same user serializes first and
+    # does not hold a slot while waiting on their previous message; extras get a busy reply.
     max_concurrent_tasks: int = _env_int("WECHATBRIDGE_MAX_CONCURRENT", 4)
 
     # WeChat text chunk size (characters) when splitting long replies
