@@ -5,6 +5,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.3.4] - 2026-07-27
+
+### Fixed
+
+- **User-facing WeChat copy in plain language**: help, empty `/agents` list, busy/image/file/voice notices, backend switch labels, and error mapping rewritten into short Chinese; internal jargon (CLI/MCP/cascade, English blobs, server paths, `aes_key`/CDN detail) stays in logs only.
+- **Residual “agent” wording**: confirmation UI and empty-list/help text talk about 助手; execution path still uses `invoke_subagent` / backend agent names where the CLI requires them. `/agent` danger confirm shows a user-friendly `display_prompt` without changing the crafted backend prompt.
+- **Concurrency fairness**: take the per-user lock **before** acquiring a global process slot so same-user queue wait does not occupy `WECHATBRIDGE_MAX_CONCURRENT` slots and starve other users.
+
+### Changed
+
+- **Mandatory per-cut version bump**: any user-visible behavior/fix/feature change must raise `__version__` (one cut → one patch). Formal CHANGELOG section required; do not stack long-lived work only under `[Unreleased]`.
+- `scripts/check_version_bump.py` (+ CI `version-check.yml`) fails when package paths changed since the latest `vX.Y.Z` tag but `__version__` / CHANGELOG were not advanced. Documented in `CONTRIBUTING.md`.
+
 ## [1.3.3] - 2026-07-26
 
 ### Fixed
@@ -96,7 +109,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 - Artifact send uses `realpath` so symlinks cannot escape the allowed root.
 - Inbound media size cap (`WECHATBRIDGE_MAX_INBOUND_BYTES`, default 20MB); CDN download URL host allowlist.
 - Inbound CDN download is **streamed** and aborts as soon as the size cap is exceeded (no full-body buffer when Content-Length is missing).
-- Global concurrency limit (`WECHATBRIDGE_MAX_CONCURRENT`, default 4) with busy reply when full. Same user is serialized first so queue wait does not occupy a global slot (one slot per user while processing).
+- Global concurrency limit (`WECHATBRIDGE_MAX_CONCURRENT`, default 4) with busy reply when full.
 - Session dirs and runtime data dirs created as `0700`; QR/state files `0600`.
 
 ### Fixed
