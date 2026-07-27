@@ -5,6 +5,12 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-07-27
+
+### Fixed
+
+- **Package description/docstring consistency**: the `wechatbridge` package docstring and the `runner_common.py` module docstring now list all three backends (agy, Grok Build, and Codex) instead of only agy/Grok. No behavior change.
+
 ## [1.4.0] - 2026-07-27
 
 ### Added

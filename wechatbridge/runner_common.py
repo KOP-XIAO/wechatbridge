@@ -1,8 +1,8 @@
-"""Shared logic for agy and grok CLI backends.
+"""Shared logic for agy, grok, and codex CLI backends.
 
 Contains session isolation, preference persistence, output cleanup,
 dangerous prompt detection, and process management helpers used by
-both agy.py and grok.py.
+agy.py, grok.py, and codex.py.
 """
 
 import asyncio
