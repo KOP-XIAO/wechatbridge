@@ -684,9 +684,11 @@ class TestCodexRunFakeCli(unittest.IsolatedAsyncioTestCase):
         # 续轮：thread.started 正常输出，但随后 turn.failed("rate limit exceeded")，
         # returncode=1。这是普通限流错误，不是 resume/session 错误，不得 fallback，
         # 旧 thread_id 必须保留，且只运行一次（无重试）。
+        # 限流最终用户文案用 🔔（不是 ❌）。
         log = os.path.join(self.td, "inv-turn-fail.log")
         display, _ = self._run("again", "u-turn-fail", mode="resume_turn_fail", log_path=log)
-        self.assertTrue(display.startswith("❌"))
+        self.assertTrue(display.startswith("🔔"), msg=display[:80])
+        self.assertIn("**请求较多**", display)
         # 旧 thread_id 保留
         self.assertEqual(_read_tid(sd), old_tid)
         # 只运行一次（无降级重试）

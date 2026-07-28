@@ -18,7 +18,7 @@ from .runner_common import (
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
-    format_error, format_cli_error, EMPTY_REPLY, validate_add_dir,
+    format_error, format_cli_error, is_bridge_formatted_reply, EMPTY_REPLY, validate_add_dir,
 )
 
 logger = logging.getLogger("grok_runner")
@@ -458,10 +458,11 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
 
         display, artifacts = _parse_grok_output(stdout_text, session_dir, since=t0)
 
-        # Failure detection: 非零退出一律视为失败（与 agy 行为对齐），
-        # 零退出但 stdout 是结构化错误（已格式化为 ❌ 前缀）也算失败
+        # Failure detection: 非零退出一律视为失败（与 agy 行为对齐）；
+        # 零退出但 stdout 是已格式化的错误/通知气泡（❌ 或 🔔，含限流）也算失败。
+        # 禁止仅靠 startswith("❌")——🔔 限流气泡也必须算 failed，且不得二次 format。
         failed = process.returncode != 0 or (
-            isinstance(display, str) and display.startswith("❌")
+            isinstance(display, str) and is_bridge_formatted_reply(display)
         )
         if process.returncode != 0:
             logger.warning(
@@ -469,7 +470,9 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
                 process.returncode, user_id, stderr_text,
             )
             artifacts = []
-            if not (isinstance(display, str) and display.startswith("❌")):
+            # 已是 format_error|format_notice 气泡时禁止再 format_cli_error，
+            # 否则 🔔 限流文案会被洗成 ❌ 执行失败，A 防护失效。
+            if not (isinstance(display, str) and is_bridge_formatted_reply(display)):
                 raw_err = stderr_text or ("" if display == EMPTY_REPLY else display) or "process exited abnormally"
                 display = format_cli_error(raw_err, backend="grok")
 
@@ -509,7 +512,7 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
                 r_stderr_text = r_stderr.decode("utf-8", errors="replace").strip()
                 r_display, r_artifacts = _parse_grok_output(r_stdout_text, session_dir, since=t0)
                 r_failed = retry_process.returncode != 0 or (
-                    isinstance(r_display, str) and r_display.startswith("❌")
+                    isinstance(r_display, str) and is_bridge_formatted_reply(r_display)
                 )
                 if retry_process.returncode != 0:
                     logger.warning(
@@ -517,7 +520,7 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
                         retry_process.returncode, user_id, r_stderr_text,
                     )
                     r_artifacts = []
-                    if not (isinstance(r_display, str) and r_display.startswith("❌")):
+                    if not (isinstance(r_display, str) and is_bridge_formatted_reply(r_display)):
                         raw_err = r_stderr_text or ("" if r_display == EMPTY_REPLY else r_display) or "process exited abnormally"
                         r_display = format_cli_error(raw_err, backend="grok")
                 if not r_failed:
@@ -530,6 +533,7 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
                 return r_display, r_artifacts
 
         # Only mark session initialized on a real successful reply
+        # (never on 🔔 限流 / ❌ 错误气泡，即使 CLI 零退出)
         if first and not failed:
             mark_initialized(session_dir, backend="grok")
 
@@ -643,7 +647,8 @@ async def _cmd_model(args: str, user_id: str) -> str:
         return "❌ **缺少参数** ❌\n\n`/model <名称>`"
 
     output = await _run_grok_subcommand(["models"], user_id)
-    if output.startswith("❌"):
+    # 认 ❌/🔔 格式化错误气泡与限流通知，勿把中文错误当模型列表 parse
+    if is_bridge_formatted_reply(output):
         return "❌ **无法获取模型列表** ❌"
 
     models = _parse_grok_models(output)

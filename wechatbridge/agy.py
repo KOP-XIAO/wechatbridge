@@ -17,7 +17,7 @@ from .runner_common import (
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
-    format_error, format_cli_error, EMPTY_REPLY,
+    format_error, format_cli_error, is_bridge_formatted_reply, EMPTY_REPLY,
     ANSI_RE, HTML_TAG_RE, validate_add_dir,
 )
 
@@ -265,7 +265,11 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
                         r_artifacts = extract_artifacts(r_stdout_text)
                         r_display = clean_output(r_stdout_text) or EMPTY_REPLY
                         r_display = re.sub(r"\[([^\]]+)\]\(file:///[^)]+\)", r"[\1]", r_display)
-                        if first and r_display != EMPTY_REPLY and not r_display.startswith("❌"):
+                        if (
+                            first
+                            and r_display != EMPTY_REPLY
+                            and not is_bridge_formatted_reply(r_display)
+                        ):
                             mark_initialized(session_dir, backend="agy")
                         return r_display, r_artifacts
                     return format_error(
@@ -277,8 +281,8 @@ async def run_agy(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
             raw = stderr_text or stdout_text or display or "process exited abnormally"
             return format_cli_error(raw, backend="agy"), []
 
-        # Success path only
-        if first and display != EMPTY_REPLY:
+        # Success path only — never mark on ❌/🔔 error/throttle bubbles
+        if first and display != EMPTY_REPLY and not is_bridge_formatted_reply(display):
             mark_initialized(session_dir, backend="agy")
 
         elapsed = time.time() - t0
@@ -535,7 +539,8 @@ async def _cmd_model(args: str, user_id: str) -> str:
         return "❌ **缺少参数** ❌\n\n`/model <名称>`"
 
     output = await _run_agy_subcommand(["models"], user_id)
-    if output.startswith("[error]") or output.startswith("❌"):
+    # 认 ❌/🔔 格式化错误气泡与限流通知，勿把中文错误当模型列表 parse
+    if output.startswith("[error]") or is_bridge_formatted_reply(output):
         return "❌ **无法获取模型列表** ❌"
 
     models = [line.strip() for line in output.split("\n") if line.strip()]

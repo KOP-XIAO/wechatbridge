@@ -102,6 +102,34 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int_list(name: str, default: str) -> list:
+    """Parse comma-separated positive integers from env (e.g. backoff seconds)."""
+    raw = os.getenv(name, default)
+    out: list = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            n = int(part)
+        except ValueError:
+            logger.warning("Invalid %s item %r, skipping", name, part)
+            continue
+        if n < 0:
+            logger.warning("Negative %s item %r, skipping", name, part)
+            continue
+        out.append(n)
+    if out:
+        return out
+    # Fallback to default list if env was empty/invalid
+    fallback: list = []
+    for part in default.split(","):
+        part = part.strip()
+        if part:
+            fallback.append(int(part))
+    return fallback
+
+
 # ---------------------------------------------------------------------------
 # Instance identity — all per-instance paths derive from this
 # ---------------------------------------------------------------------------
@@ -246,6 +274,25 @@ class AppConfig:
     pending_confirm_ttl: int = _env_int("WECHATBRIDGE_PENDING_TTL", 300)
     # Confirmation keyword users must reply to execute dangerous prompt
     confirm_token: str = os.getenv("WECHATBRIDGE_CONFIRM_TOKEN", "y")
+
+    # Upstream throttle guard (process-wide, covers agy/grok/codex)
+    # Extra retries after the first attempt for short-window throttle (default 2 → 3 total)
+    upstream_retry_max: int = _env_int("WECHATBRIDGE_UPSTREAM_RETRY_MAX", 2)
+    # Extra retries for 额度相关 (default 0 — mark cooldown/gap but do not spam CLI)
+    upstream_quota_retry_max: int = _env_int("WECHATBRIDGE_UPSTREAM_QUOTA_RETRY_MAX", 0)
+    # Per-retry backoff seconds (indexed by failed attempt 0,1,2,…)
+    upstream_backoff: list = _env_int_list("WECHATBRIDGE_UPSTREAM_BACKOFF", "2,5,12")
+    # Global cooldown after any throttle signal (seconds)
+    upstream_cooldown: int = _env_int("WECHATBRIDGE_UPSTREAM_COOLDOWN", 20)
+    # Per-user silent gap after throttle (seconds); no WeChat notice while waiting
+    upstream_user_gap: int = _env_int("WECHATBRIDGE_UPSTREAM_USER_GAP", 10)
+
+    # After A/B/C released-sleep, re-acquire the global concurrency slot with a
+    # short timeout (seconds) and limited attempts. Better than sleeping while
+    # holding the slot; on final timeout the user gets the same busy reply as
+    # initial fail-fast concurrency full.
+    slot_reacquire_timeout: float = _env_float("WECHATBRIDGE_SLOT_REACQUIRE_TIMEOUT", 0.5)
+    slot_reacquire_attempts: int = _env_int("WECHATBRIDGE_SLOT_REACQUIRE_ATTEMPTS", 3)
 
 
 config = AppConfig()

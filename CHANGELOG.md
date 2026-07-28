@@ -5,6 +5,24 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-07-28
+
+### Added
+
+- **Upstream throttle guard (all backends)**: agy / grok / codex share `_run_llm_with_guard` — limited backoff retries after control-plane / rate-limit style failures, global cooldown, and per-user silent gap after a throttle. Retry and cooldown notices use 🔔; final throttle-class errors also use 🔔. Config: `WECHATBRIDGE_UPSTREAM_RETRY_MAX`, `WECHATBRIDGE_UPSTREAM_BACKOFF`, `WECHATBRIDGE_UPSTREAM_COOLDOWN`, `WECHATBRIDGE_UPSTREAM_USER_GAP`, `WECHATBRIDGE_UPSTREAM_QUOTA_RETRY_MAX` (quota defaults to no extra retries). Documented in `deploy/wechatbridge.env.example`.
+- **Concurrency-friendly waits**: user gap and global cooldown run before taking a global process slot; in-slot backoff releases the slot while sleeping and re-acquires with timeout (`WECHATBRIDGE_SLOT_REACQUIRE_TIMEOUT` / `ATTEMPTS`), falling back to the existing “现在有点忙” path if the pool stays full.
+
+### Fixed
+
+- **Error copy split**: `RESOURCE_EXHAUSTED` / eligibility / bare 429 map to “助手通道繁忙”, explicit rate limits to “请求较多”, real quota exhaustion to “额度相关” — no longer a single “请求过于频繁” that looks like user spam when Google control-plane eligibility flickers.
+- **Grok 🔔 contract**: failure / already-formatted detection no longer requires `❌` only; bridge error bubbles (🔔 or ❌) are not re-`format_cli_error`’d into generic “执行失败”, so outer retry/cooldown still works. Zero-exit structured throttle no longer `mark_initialized`. `/model` treats 🔔/❌ bubbles as fetch failure, not a model list.
+- **Stricter throttle detection**: only real bridge 🔔 bubbles count as throttle replies; bare substring `429` / vague “quota” wording tightened to reduce false positives.
+- Guard notification `send_message` failures are logged and do not abort the retry path.
+
+### Tests
+
+- Hardening coverage for guard A/B/C, slot re-acquire, format_cli_error branches, and mocked `run_grok` throttle paths.
+
 ## [1.4.1] - 2026-07-27
 
 ### Fixed

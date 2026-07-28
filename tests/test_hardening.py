@@ -248,7 +248,9 @@ class TestFormatCliErrorCodex(unittest.TestCase):
     def test_codex_rate_limit_not_login(self):
         out = self._fmt("Rate limit reached, please slow down", "codex")
         self.assertNotIn("**未登录**", out)
-        self.assertIn("**请求过于频繁**", out)
+        self.assertIn("**请求较多**", out)
+        self.assertIn("🔔", out)
+        self.assertNotIn("❌", out)
 
     def test_codex_model_not_found_not_login(self):
         out = self._fmt("error: model not found: gpt-9", "codex")
@@ -816,6 +818,814 @@ class TestPerUserLockContract(unittest.IsolatedAsyncioTestCase):
             rel_a.set()
             rel_b.set()
             await asyncio.gather(t_a, t_b, return_exceptions=True)
+
+
+class TestFormatCliErrorRateQuota(unittest.TestCase):
+    """Split eligibility/429/quota so users are not told they spam when
+    Google control-plane eligibility is temporarily RESOURCE_EXHAUSTED.
+
+    Throttle / quota final user copy uses 🔔 (not ❌).
+    """
+
+    def _fmt(self, raw: str, backend: str = "agy") -> str:
+        from wechatbridge.runner_common import format_cli_error
+
+        return format_cli_error(raw, backend=backend)
+
+    def _assert_notice(self, out: str, title: str) -> None:
+        self.assertIn(f"**{title}**", out)
+        self.assertIn("🔔", out)
+        self.assertNotIn("❌", out)
+        self.assertNotIn("请求过于频繁", out)
+
+    def test_eligibility_resource_exhausted_not_too_frequent(self):
+        raw = (
+            "Eligibility check failed: RESOURCE_EXHAUSTED (code 429): "
+            "Resource has been exhausted (e.g. check quota)."
+        )
+        out = self._fmt(raw)
+        self._assert_notice(out, "助手通道繁忙")
+        self.assertIn("暂时限流或繁忙", out)
+        self.assertNotIn("用得有点多", out)
+
+    def test_resource_exhausted_without_eligibility(self):
+        out = self._fmt("gRPC error: RESOURCE_EXHAUSTED: Resource has been exhausted")
+        self._assert_notice(out, "助手通道繁忙")
+
+    def test_explicit_rate_limit(self):
+        out = self._fmt("Error: rate limit exceeded, please slow down")
+        self._assert_notice(out, "请求较多")
+        self.assertNotIn("额度相关", out)
+
+    def test_too_many_requests(self):
+        out = self._fmt("HTTP 429 Too Many Requests")
+        # "too many requests" is more specific than bare 429
+        self._assert_notice(out, "请求较多")
+
+    def test_quota_exceeded(self):
+        out = self._fmt("You exceeded your current quota, please check billing")
+        self._assert_notice(out, "额度相关")
+        self.assertNotIn("助手通道繁忙", out)
+
+    def test_bare_429_not_too_frequent(self):
+        out = self._fmt("upstream returned status 429")
+        self._assert_notice(out, "助手通道繁忙")
+
+    def test_auth_branch_still_login(self):
+        out = self._fmt("Not signed in. Please run login --device")
+        self.assertIn("未登录", out)
+        self.assertIn("❌", out)
+        self.assertNotIn("🔔", out)
+
+    def test_timeout_branch_unchanged(self):
+        out = self._fmt("Timeout waiting for cascade response")
+        self.assertIn("模型响应超时", out)
+        self.assertIn("❌", out)
+
+
+class TestFormatNoticeAndThrottleDetect(unittest.TestCase):
+    def test_format_notice_bell(self):
+        from wechatbridge.runner_common import format_notice
+
+        out = format_notice("上游繁忙，正在重试", "第 1/2 次重试，请稍候…")
+        self.assertTrue(out.startswith("🔔"))
+        self.assertIn("**上游繁忙，正在重试**", out)
+        self.assertIn("第 1/2 次", out)
+        self.assertNotIn("❌", out)
+
+    def test_format_notice_title_only(self):
+        from wechatbridge.runner_common import format_notice
+
+        out = format_notice("上游冷却中")
+        self.assertEqual(out, "🔔 **上游冷却中** 🔔")
+
+    def test_is_upstream_throttle_reply_positive(self):
+        from wechatbridge.runner_common import (
+            format_cli_error,
+            format_notice,
+            is_upstream_throttle_reply,
+        )
+
+        for raw in (
+            "RESOURCE_EXHAUSTED (code 429)",
+            "rate limit exceeded",
+            "quota exceeded",
+            "status 429",
+        ):
+            out = format_cli_error(raw, backend="agy")
+            self.assertTrue(is_upstream_throttle_reply(out), msg=out)
+
+        self.assertTrue(
+            is_upstream_throttle_reply(format_notice("请求较多", "稍后再试"))
+        )
+
+    def test_is_upstream_throttle_reply_negative(self):
+        from wechatbridge.runner_common import (
+            format_cli_error,
+            format_error,
+            is_upstream_throttle_reply,
+        )
+
+        self.assertFalse(is_upstream_throttle_reply(""))
+        self.assertFalse(is_upstream_throttle_reply(None))  # type: ignore[arg-type]
+        self.assertFalse(is_upstream_throttle_reply("普通回复文本"))
+        self.assertFalse(
+            is_upstream_throttle_reply(format_error("未登录", "请联系管理员"))
+        )
+        self.assertFalse(
+            is_upstream_throttle_reply(
+                format_cli_error("Timeout waiting for cascade response")
+            )
+        )
+        # Free-text title without bold markers must not match
+        self.assertFalse(is_upstream_throttle_reply("助手通道繁忙 请稍后再试"))
+        # Normal model reply that happens to mention a throttle title in bold
+        # must NOT trigger retry (requires real 🔔 bubble header)
+        self.assertFalse(
+            is_upstream_throttle_reply(
+                "说明一下：上游出现 **请求较多** 时会限流，这是正常设计。"
+            )
+        )
+        self.assertFalse(
+            is_upstream_throttle_reply(
+                "关于 **助手通道繁忙** 的排查步骤如下……"
+            )
+        )
+
+    def test_is_bridge_formatted_reply(self):
+        from wechatbridge.runner_common import (
+            format_error,
+            format_notice,
+            is_bridge_formatted_reply,
+        )
+
+        self.assertTrue(is_bridge_formatted_reply(format_error("未登录", "x")))
+        self.assertTrue(is_bridge_formatted_reply(format_notice("请求较多", "y")))
+        self.assertTrue(is_bridge_formatted_reply("🔔 **额度相关** 🔔"))
+        self.assertFalse(is_bridge_formatted_reply(""))
+        self.assertFalse(is_bridge_formatted_reply("普通回复"))
+        self.assertFalse(is_bridge_formatted_reply("**请求较多** 没有 emoji"))
+        self.assertFalse(is_bridge_formatted_reply("❌ bare cross without bold title ❌"))
+
+    def test_classify_upstream_failure(self):
+        from wechatbridge.runner_common import (
+            classify_upstream_failure,
+            format_notice,
+            is_upstream_quota_reply,
+        )
+
+        thr = format_notice("助手通道繁忙", "稍等")
+        quo = format_notice("额度相关", "配额受限")
+        self.assertEqual(classify_upstream_failure(thr), "throttle")
+        self.assertEqual(classify_upstream_failure(quo), "quota")
+        self.assertTrue(is_upstream_quota_reply(quo))
+        self.assertFalse(is_upstream_quota_reply(thr))
+        self.assertIsNone(classify_upstream_failure("hello"))
+
+
+class TestFormatCliErrorTightening(unittest.TestCase):
+    """#6: bare 429 / wide quota must not over-match."""
+
+    def _fmt(self, raw: str) -> str:
+        from wechatbridge.runner_common import format_cli_error
+
+        return format_cli_error(raw, backend="agy")
+
+    def test_1429_not_bare_429(self):
+        out = self._fmt("internal error code 1429 in pipeline stage")
+        self.assertNotIn("助手通道繁忙", out)
+        self.assertNotIn("请求较多", out)
+        # Falls through to generic 执行失败
+        self.assertIn("执行失败", out)
+
+    def test_quota_usage_report_not_quota(self):
+        out = self._fmt("quota usage report ready for download")
+        self.assertNotIn("额度相关", out)
+        self.assertIn("执行失败", out)
+
+    def test_eligibility_still_busy(self):
+        out = self._fmt(
+            "Eligibility check failed: RESOURCE_EXHAUSTED (code 429): "
+            "Resource has been exhausted (e.g. check quota)."
+        )
+        self.assertIn("助手通道繁忙", out)
+        self.assertIn("🔔", out)
+
+    def test_status_429_still_busy(self):
+        out = self._fmt("upstream returned status 429")
+        self.assertIn("助手通道繁忙", out)
+
+
+class TestUpstreamGuard(unittest.TestCase):
+    def test_mark_and_remaining(self):
+        from wechatbridge.runner_common import UpstreamGuard
+        from wechatbridge import config as cfg_mod
+
+        g = UpstreamGuard()
+        with mock.patch.object(cfg_mod.config, "upstream_cooldown", 20), mock.patch.object(
+            cfg_mod.config, "upstream_user_gap", 10
+        ):
+            g.mark_throttle("u1")
+            self.assertGreater(g.global_remaining(), 15)
+            self.assertLessEqual(g.global_remaining(), 20)
+            self.assertGreater(g.user_gap_remaining("u1"), 5)
+            self.assertLessEqual(g.user_gap_remaining("u1"), 10)
+            self.assertEqual(g.user_gap_remaining("other"), 0.0)
+
+            g.clear_user_gap("u1")
+            self.assertEqual(g.user_gap_remaining("u1"), 0.0)
+            # global cooldown kept after clear_user_gap
+            self.assertGreater(g.global_remaining(), 0)
+
+    def test_mark_extends_not_shortens(self):
+        from wechatbridge.runner_common import UpstreamGuard
+        from wechatbridge import config as cfg_mod
+
+        g = UpstreamGuard()
+        with mock.patch.object(cfg_mod.config, "upstream_cooldown", 30), mock.patch.object(
+            cfg_mod.config, "upstream_user_gap", 5
+        ):
+            g.mark_throttle("u1")
+            first_global = g.global_cooldown_until
+            with mock.patch.object(cfg_mod.config, "upstream_cooldown", 5):
+                g.mark_throttle("u1")
+            # shorter second mark must not pull global_cooldown backward
+            self.assertEqual(g.global_cooldown_until, first_global)
+
+
+class TestRunLlmWithGuard(unittest.IsolatedAsyncioTestCase):
+    """Behaviour of main._run_llm_with_guard (A/B/C) with mocked _run_llm."""
+
+    async def asyncSetUp(self):
+        from wechatbridge.runner_common import UpstreamGuard
+        from wechatbridge import main as main_mod
+
+        self.main = main_mod
+        # Fresh guard so tests don't leak state
+        self.guard = UpstreamGuard()
+        self._guard_patch = mock.patch.object(main_mod, "upstream_guard", self.guard)
+        self._guard_patch.start()
+        self.client = MagicMock()
+        self.client.state = MagicMock()
+        self.client.state.baseurl = "https://example.test"
+        self.client.state.bot_token = "tok"
+        self.client.send_message = AsyncMock(return_value=True)
+        self.sent_texts: list[str] = []
+
+        async def _capture_send(**kwargs):
+            self.sent_texts.append(kwargs.get("text") or "")
+            return True
+
+        self.client.send_message.side_effect = _capture_send
+
+    async def asyncTearDown(self):
+        self._guard_patch.stop()
+
+    def _throttle(self, title: str = "助手通道繁忙") -> tuple[str, list]:
+        from wechatbridge.runner_common import format_notice
+
+        return format_notice(title, "上游助手通道暂时限流或繁忙，请稍等片刻再试。"), []
+
+    def _ok(self, text: str = "hello") -> tuple[str, list]:
+        return text, []
+
+    async def test_success_no_retry(self):
+        with mock.patch.object(
+            self.main, "_run_llm", new=AsyncMock(return_value=self._ok("ok"))
+        ) as run, mock.patch.object(
+            self.main.asyncio, "sleep", new=AsyncMock()
+        ) as sleep:
+            reply, arts = await self.main._run_llm_with_guard(
+                self.client, "user-a", "ctx", "hi"
+            )
+        self.assertEqual(reply, "ok")
+        self.assertEqual(arts, [])
+        self.assertEqual(run.await_count, 1)
+        self.assertEqual(self.sent_texts, [])
+        sleep.assert_not_awaited()
+
+    async def test_A_retry_then_success(self):
+        from wechatbridge import config as cfg_mod
+
+        throttle = self._throttle()
+        ok = self._ok("recovered")
+        run = AsyncMock(side_effect=[throttle, ok])
+        with mock.patch.object(self.main, "_run_llm", new=run), mock.patch.object(
+            self.main.asyncio, "sleep", new=AsyncMock()
+        ) as sleep, mock.patch.object(
+            cfg_mod.config, "upstream_retry_max", 2
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_backoff", [2, 5, 12]
+        ), mock.patch.object(
+            self.main, "_get_backend", return_value="agy"
+        ):
+            reply, _ = await self.main._run_llm_with_guard(
+                self.client, "user-a", "ctx", "hi"
+            )
+        self.assertEqual(reply, "recovered")
+        self.assertEqual(run.await_count, 2)
+        self.assertEqual(len(self.sent_texts), 1)
+        self.assertIn("上游繁忙，正在重试", self.sent_texts[0])
+        self.assertIn("🔔", self.sent_texts[0])
+        self.assertIn("第 1/2 次", self.sent_texts[0])
+        sleep.assert_awaited()
+        # user gap cleared on success
+        self.assertEqual(self.guard.user_gap_remaining("user-a"), 0.0)
+
+    async def test_A_exhaust_retries_returns_throttle(self):
+        from wechatbridge import config as cfg_mod
+
+        throttle = self._throttle("请求较多")
+        run = AsyncMock(return_value=throttle)
+        with mock.patch.object(self.main, "_run_llm", new=run), mock.patch.object(
+            self.main.asyncio, "sleep", new=AsyncMock()
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_retry_max", 2
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_backoff", [0, 0, 0]
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_cooldown", 20
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_user_gap", 10
+        ), mock.patch.object(
+            self.main, "_get_backend", return_value="codex"
+        ):
+            reply, _ = await self.main._run_llm_with_guard(
+                self.client, "user-b", "ctx", "hi"
+            )
+        self.assertIn("请求较多", reply)
+        self.assertIn("🔔", reply)
+        self.assertEqual(run.await_count, 3)  # 1 + 2 retries
+        # A notices for each retry (not for the final failure)
+        self.assertEqual(len(self.sent_texts), 2)
+        for t in self.sent_texts:
+            self.assertIn("上游繁忙，正在重试", t)
+            self.assertIn("🔔", t)
+        self.assertGreater(self.guard.global_remaining(), 0)
+        self.assertGreater(self.guard.user_gap_remaining("user-b"), 0)
+
+    async def test_B_global_cooldown_notifies(self):
+        from wechatbridge import config as cfg_mod
+
+        self.guard.global_cooldown_until = time.time() + 7.0
+        with mock.patch.object(
+            self.main, "_run_llm", new=AsyncMock(return_value=self._ok("after-cool"))
+        ), mock.patch.object(
+            self.main.asyncio, "sleep", new=AsyncMock()
+        ) as sleep, mock.patch.object(
+            cfg_mod.config, "upstream_retry_max", 0
+        ):
+            reply, _ = await self.main._run_llm_with_guard(
+                self.client, "user-c", "ctx", "hi"
+            )
+        self.assertEqual(reply, "after-cool")
+        self.assertEqual(len(self.sent_texts), 1)
+        self.assertIn("上游冷却中", self.sent_texts[0])
+        self.assertIn("🔔", self.sent_texts[0])
+        self.assertIn("秒后自动继续", self.sent_texts[0])
+        # slept for the remaining cooldown
+        self.assertTrue(sleep.await_count >= 1)
+        cool_arg = sleep.await_args_list[0].args[0]
+        self.assertGreater(cool_arg, 5)
+
+    async def test_C_user_gap_silent(self):
+        from wechatbridge import config as cfg_mod
+
+        self.guard.user_gap_until["user-d"] = time.time() + 4.0
+        with mock.patch.object(
+            self.main, "_run_llm", new=AsyncMock(return_value=self._ok("after-gap"))
+        ), mock.patch.object(
+            self.main.asyncio, "sleep", new=AsyncMock()
+        ) as sleep, mock.patch.object(
+            cfg_mod.config, "upstream_retry_max", 0
+        ):
+            reply, _ = await self.main._run_llm_with_guard(
+                self.client, "user-d", "ctx", "hi"
+            )
+        self.assertEqual(reply, "after-gap")
+        # C: no WeChat notice while waiting the gap
+        self.assertEqual(self.sent_texts, [])
+        self.assertTrue(sleep.await_count >= 1)
+        gap_arg = sleep.await_args_list[0].args[0]
+        self.assertGreater(gap_arg, 2)
+
+    async def test_non_throttle_error_no_retry(self):
+        from wechatbridge.runner_common import format_error
+
+        err = format_error("未登录", "请联系管理员"), []
+        with mock.patch.object(
+            self.main, "_run_llm", new=AsyncMock(return_value=err)
+        ) as run, mock.patch.object(
+            self.main.asyncio, "sleep", new=AsyncMock()
+        ):
+            reply, _ = await self.main._run_llm_with_guard(
+                self.client, "user-e", "ctx", "hi"
+            )
+        self.assertIn("未登录", reply)
+        self.assertEqual(run.await_count, 1)
+        self.assertEqual(self.sent_texts, [])
+
+    async def test_quota_default_no_retry(self):
+        """#7: 额度相关 must not burn short-window retry budget (default 0 extra)."""
+        from wechatbridge import config as cfg_mod
+
+        quota = self._throttle("额度相关")
+        run = AsyncMock(return_value=quota)
+        with mock.patch.object(self.main, "_run_llm", new=run), mock.patch.object(
+            self.main, "_guard_sleep", new=AsyncMock()
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_retry_max", 2
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_quota_retry_max", 0
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_cooldown", 20
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_user_gap", 10
+        ), mock.patch.object(
+            self.main, "_get_backend", return_value="agy"
+        ):
+            reply, _ = await self.main._run_llm_with_guard(
+                self.client, "user-quota", "ctx", "hi"
+            )
+        self.assertIn("额度相关", reply)
+        self.assertIn("🔔", reply)
+        # Only the first attempt — no extra retries
+        self.assertEqual(run.await_count, 1)
+        self.assertEqual(self.sent_texts, [])  # no A retry notices
+        # Still marks cooldown / gap so we do not hammer immediately
+        self.assertGreater(self.guard.global_remaining(), 0)
+        self.assertGreater(self.guard.user_gap_remaining("user-quota"), 0)
+
+    async def test_guard_sleep_releases_global_slot(self):
+        """#4: A/C/B sleeps must not hold the global concurrency semaphore."""
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()  # we own the only slot, matching _safe_process_message
+        slot = self.main._GlobalSlot(sem)
+        token = self.main._global_slot_ctx.set(slot)
+        try:
+            self.assertTrue(slot.held)
+            # While sleeping with slot released, another waiter can acquire
+            acquired = asyncio.Event()
+
+            async def other():
+                await sem.acquire()
+                acquired.set()
+                sem.release()
+
+            t = asyncio.create_task(other())
+            # Give other a chance — should NOT acquire while we still hold
+            await asyncio.sleep(0)
+            self.assertFalse(acquired.is_set())
+
+            sleep_task = asyncio.create_task(self.main._guard_sleep(0.05))
+            # other should get the slot during our released sleep
+            await asyncio.wait_for(acquired.wait(), timeout=1.0)
+            await sleep_task
+            await t
+            self.assertTrue(slot.held)
+        finally:
+            self.main._global_slot_ctx.reset(token)
+            if slot.held:
+                sem.release()
+                slot.held = False
+
+    async def test_A_send_message_failure_still_retries(self):
+        """Optional polish: A retry notice send_message raise must not abort retries."""
+        from wechatbridge import config as cfg_mod
+
+        throttle = self._throttle()
+        ok = self._ok("recovered-after-send-fail")
+        run = AsyncMock(side_effect=[throttle, ok])
+        self.client.send_message = AsyncMock(side_effect=RuntimeError("net down"))
+        with mock.patch.object(self.main, "_run_llm", new=run), mock.patch.object(
+            self.main, "_guard_sleep", new=AsyncMock()
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_retry_max", 2
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_backoff", [0, 0, 0]
+        ), mock.patch.object(
+            self.main, "_get_backend", return_value="agy"
+        ):
+            reply, _ = await self.main._run_llm_with_guard(
+                self.client, "user-send-fail", "ctx", "hi"
+            )
+        self.assertEqual(reply, "recovered-after-send-fail")
+        self.assertEqual(run.await_count, 2)
+        self.client.send_message.assert_awaited()
+
+    async def test_B_send_message_failure_still_sleeps_and_runs(self):
+        """Optional polish: B cooldown notice send_message raise must not abort."""
+        from wechatbridge import config as cfg_mod
+
+        self.guard.global_cooldown_until = time.time() + 7.0
+        self.client.send_message = AsyncMock(side_effect=RuntimeError("net down"))
+        with mock.patch.object(
+            self.main, "_run_llm", new=AsyncMock(return_value=self._ok("after-cool"))
+        ) as run, mock.patch.object(
+            self.main, "_guard_sleep", new=AsyncMock()
+        ) as sleep, mock.patch.object(
+            cfg_mod.config, "upstream_retry_max", 0
+        ):
+            reply, _ = await self.main._run_llm_with_guard(
+                self.client, "user-b-send-fail", "ctx", "hi"
+            )
+        self.assertEqual(reply, "after-cool")
+        self.assertEqual(run.await_count, 1)
+        sleep.assert_awaited()
+        self.client.send_message.assert_awaited()
+
+    async def test_slot_reacquire_timeout_returns_busy(self):
+        """Optional polish: after A backoff, re-acquire timeout → 现在有点忙, no leak."""
+        from wechatbridge import config as cfg_mod
+
+        # Simulate _safe_process_message: this task holds the only global slot.
+        # During A backoff sleep_released releases it; a peer steals it and never
+        # gives it back → re-acquire times out → busy reply, held stays False.
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()
+        our_slot = self.main._GlobalSlot(sem)
+        token = self.main._global_slot_ctx.set(our_slot)
+        throttle = self._throttle()
+        run = AsyncMock(return_value=throttle)
+        peer_held = {"ok": False}
+
+        async def steal_during_sleep(_seconds):
+            if not peer_held["ok"] and not our_slot.held:
+                await asyncio.wait_for(sem.acquire(), timeout=0.2)
+                peer_held["ok"] = True  # keep holding — force re-acquire timeout
+            return None
+
+        try:
+            with mock.patch.object(self.main, "_run_llm", new=run), mock.patch.object(
+                self.main.asyncio, "sleep", new=AsyncMock(side_effect=steal_during_sleep)
+            ), mock.patch.object(
+                cfg_mod.config, "upstream_retry_max", 2
+            ), mock.patch.object(
+                cfg_mod.config, "upstream_backoff", [0.01]
+            ), mock.patch.object(
+                cfg_mod.config, "slot_reacquire_timeout", 0.05
+            ), mock.patch.object(
+                cfg_mod.config, "slot_reacquire_attempts", 2
+            ), mock.patch.object(
+                self.main, "_get_backend", return_value="agy"
+            ):
+                reply, arts = await self.main._run_llm_with_guard(
+                    self.client, "user-reaq", "ctx", "hi"
+                )
+            self.assertIn("现在有点忙", reply)
+            self.assertEqual(arts, [])
+            # Slot must not claim held if re-acquire failed (no double-release later)
+            self.assertFalse(our_slot.held)
+            self.assertTrue(peer_held["ok"])
+            # peer still owns the only permit
+            self.assertEqual(sem._value, 0)
+        finally:
+            self.main._global_slot_ctx.reset(token)
+            if our_slot.held:
+                sem.release()
+                our_slot.held = False
+            if peer_held.get("ok") and sem._value == 0:
+                try:
+                    sem.release()
+                except ValueError:
+                    pass
+
+
+class _FakeGrokProc:
+    """Minimal asyncio subprocess stand-in for run_grok path tests."""
+
+    def __init__(self, stdout="", stderr="", rc=0, pid=4242):
+        self._so = stdout.encode("utf-8")
+        self._se = stderr.encode("utf-8")
+        self.returncode = rc
+        self.pid = pid
+
+    async def communicate(self):
+        return self._so, self._se
+
+
+class TestGrokThrottlePreserve(unittest.IsolatedAsyncioTestCase):
+    """#1/#2: drive real run_grok with mocked subprocess (no real grok binary)."""
+
+    async def asyncSetUp(self):
+        from wechatbridge.config import config
+
+        self.td = tempfile.mkdtemp(prefix="wb-grok-throttle-")
+        self._patchers = [
+            mock.patch.object(config, "session_base_dir", self.td),
+            mock.patch.object(config, "agy_timeout", 30),
+            mock.patch.object(config, "grok_binary_path", "grok"),
+            # Avoid depending on host ~/.grok/auth.json
+            mock.patch(
+                "wechatbridge.grok._sync_grok_auth", return_value=True
+            ),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    async def asyncTearDown(self):
+        for p in self._patchers:
+            p.stop()
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _session_dir(self, user_id: str) -> str:
+        from wechatbridge.runner_common import sanitize_user_id
+
+        return os.path.join(self.td, sanitize_user_id(user_id))
+
+    def _init_flag(self, user_id: str) -> str:
+        return os.path.join(self._session_dir(user_id), ".initialized.grok")
+
+    async def test_structured_rate_limit_nonzero_keeps_bell(self):
+        """Non-zero exit + structured rate-limit JSON → 🔔 throttle, not ❌ 执行失败."""
+        from wechatbridge import grok as grok_mod
+        from wechatbridge.runner_common import (
+            is_bridge_formatted_reply,
+            is_upstream_throttle_reply,
+        )
+
+        err_json = json.dumps(
+            {
+                "type": "error",
+                "message": "rate limit exceeded, please slow down",
+            }
+        )
+
+        async def spawn(*_a, **_k):
+            return _FakeGrokProc(err_json, "rate limit exceeded", rc=1)
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            display, arts = await grok_mod.run_grok("hi", "u-rl-nz")
+
+        self.assertEqual(arts, [])
+        self.assertTrue(display.startswith("🔔"), msg=display[:120])
+        self.assertIn("请求较多", display)
+        self.assertTrue(is_bridge_formatted_reply(display))
+        self.assertTrue(is_upstream_throttle_reply(display))
+        # Must not be washed into generic execution failure
+        self.assertNotIn("执行失败", display)
+        self.assertNotIn("执行出错", display)
+        self.assertFalse(os.path.isfile(self._init_flag("u-rl-nz")))
+
+    async def test_zero_exit_structured_rate_limit_no_mark(self):
+        """Zero exit + structured rate-limit bubble → failed, no mark_initialized."""
+        from wechatbridge import grok as grok_mod
+        from wechatbridge.runner_common import (
+            is_bridge_formatted_reply,
+            is_upstream_throttle_reply,
+        )
+
+        err_json = json.dumps(
+            {
+                "type": "error",
+                "message": "rate limit exceeded, please slow down",
+            }
+        )
+
+        async def spawn(*_a, **_k):
+            return _FakeGrokProc(err_json, "", rc=0)
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            display, arts = await grok_mod.run_grok("hi", "u-rl-z")
+
+        self.assertEqual(arts, [])
+        self.assertTrue(display.startswith("🔔"), msg=display[:120])
+        self.assertIn("请求较多", display)
+        self.assertTrue(is_bridge_formatted_reply(display))
+        self.assertTrue(is_upstream_throttle_reply(display))
+        # Session flag must NOT be written on first-message throttle
+        self.assertFalse(os.path.isfile(self._init_flag("u-rl-z")))
+
+    async def test_guard_retries_bell_throttle_from_grok_shape(self):
+        """Guard recognises grok-shaped 🔔 rate-limit and retries."""
+        from wechatbridge import main as main_mod
+        from wechatbridge import config as cfg_mod
+        from wechatbridge.runner_common import UpstreamGuard, format_cli_error
+
+        guard = UpstreamGuard()
+        client = MagicMock()
+        client.state = MagicMock()
+        client.state.baseurl = "https://example.test"
+        client.state.bot_token = "tok"
+        sent: list[str] = []
+
+        async def _cap(**kwargs):
+            sent.append(kwargs.get("text") or "")
+            return True
+
+        client.send_message = AsyncMock(side_effect=_cap)
+        throttle = format_cli_error("rate limit exceeded", backend="grok"), []
+        ok = ("recovered", [])
+        run = AsyncMock(side_effect=[throttle, ok])
+
+        with mock.patch.object(main_mod, "upstream_guard", guard), mock.patch.object(
+            main_mod, "_run_llm", new=run
+        ), mock.patch.object(
+            main_mod, "_guard_sleep", new=AsyncMock()
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_retry_max", 2
+        ), mock.patch.object(
+            cfg_mod.config, "upstream_backoff", [0, 0, 0]
+        ), mock.patch.object(
+            main_mod, "_get_backend", return_value="grok"
+        ):
+            reply, _ = await main_mod._run_llm_with_guard(
+                client, "u-grok", "ctx", "hi"
+            )
+        self.assertEqual(reply, "recovered")
+        self.assertEqual(run.await_count, 2)
+        self.assertTrue(any("上游繁忙，正在重试" in t for t in sent))
+
+
+class TestModelCmdRejectsBellThrottle(unittest.IsolatedAsyncioTestCase):
+    """#3: /model must not parse 🔔 throttle text as a model list."""
+
+    async def test_agy_model_bell_throttle(self):
+        from wechatbridge.runner_common import format_notice
+        from wechatbridge import agy as agy_mod
+
+        thr = format_notice("助手通道繁忙", "上游限流")
+        with mock.patch.object(
+            agy_mod, "_run_agy_subcommand", new=AsyncMock(return_value=thr)
+        ):
+            out = await agy_mod._cmd_model("gemini-2.5", "u-model-agy")
+        self.assertIn("无法获取模型列表", out)
+        self.assertNotIn("模型已切换", out)
+
+    async def test_grok_model_bell_throttle(self):
+        from wechatbridge.runner_common import format_notice
+        from wechatbridge import grok as grok_mod
+
+        thr = format_notice("请求较多", "稍后再试")
+        with mock.patch.object(
+            grok_mod, "_run_grok_subcommand", new=AsyncMock(return_value=thr)
+        ):
+            out = await grok_mod._cmd_model("grok-4.5", "u-model-grok")
+        self.assertIn("无法获取模型列表", out)
+        self.assertNotIn("模型已切换", out)
+
+
+class TestEnvIntList(unittest.TestCase):
+    """#8 optional: _env_int_list boundary cases."""
+
+    def test_default_and_valid(self):
+        from wechatbridge.config import _env_int_list
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WB_TEST_BACKOFF", None)
+            self.assertEqual(_env_int_list("WB_TEST_BACKOFF", "2,5,12"), [2, 5, 12])
+        with mock.patch.dict(os.environ, {"WB_TEST_BACKOFF": "1, 3, 7"}):
+            self.assertEqual(_env_int_list("WB_TEST_BACKOFF", "2,5,12"), [1, 3, 7])
+
+    def test_skips_invalid_and_negative(self):
+        from wechatbridge.config import _env_int_list
+
+        with mock.patch.dict(os.environ, {"WB_TEST_BACKOFF": "2,x,-1,4"}):
+            self.assertEqual(_env_int_list("WB_TEST_BACKOFF", "2,5,12"), [2, 4])
+
+    def test_all_invalid_falls_back(self):
+        from wechatbridge.config import _env_int_list
+
+        with mock.patch.dict(os.environ, {"WB_TEST_BACKOFF": "x,y,-3"}):
+            self.assertEqual(_env_int_list("WB_TEST_BACKOFF", "2,5,12"), [2, 5, 12])
+
+    def test_zero_allowed(self):
+        from wechatbridge.config import _env_int_list
+
+        with mock.patch.dict(os.environ, {"WB_TEST_BACKOFF": "0,2"}):
+            self.assertEqual(_env_int_list("WB_TEST_BACKOFF", "2,5,12"), [0, 2])
+
+
+class TestPreflightBeforeSlot(unittest.IsolatedAsyncioTestCase):
+    """#4: preflight C/B runs without holding global slot."""
+
+    async def test_preflight_gap_and_cooldown(self):
+        from wechatbridge import main as main_mod
+        from wechatbridge.runner_common import UpstreamGuard
+
+        guard = UpstreamGuard()
+        guard.user_gap_until["u-pre"] = time.time() + 3.0
+        guard.global_cooldown_until = time.time() + 5.0
+        client = MagicMock()
+        client.state = MagicMock()
+        client.state.baseurl = "https://example.test"
+        client.state.bot_token = "tok"
+        sent: list[str] = []
+
+        async def _cap(**kwargs):
+            sent.append(kwargs.get("text") or "")
+            return True
+
+        client.send_message = AsyncMock(side_effect=_cap)
+
+        with mock.patch.object(main_mod, "upstream_guard", guard), mock.patch.object(
+            main_mod.asyncio, "sleep", new=AsyncMock()
+        ) as sleep:
+            await main_mod._await_upstream_preflight(client, "u-pre", "ctx")
+        # gap + cool sleeps
+        self.assertGreaterEqual(sleep.await_count, 2)
+        self.assertTrue(any("上游冷却中" in t for t in sent))
+        self.assertTrue(any("🔔" in t for t in sent))
 
 
 if __name__ == "__main__":

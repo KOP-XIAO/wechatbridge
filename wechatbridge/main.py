@@ -7,6 +7,7 @@ Architecture: WeChat ClawBot(iLink) <-> wechatbridge(Python) <-> agy/grok/codex 
 import argparse
 import asyncio
 import base64
+import contextvars
 import logging
 import os
 import sys
@@ -21,15 +22,20 @@ from .ilink import ILinkClient
 from .runner_common import (
     clean_session_media,
     clear_initialized,
+    classify_upstream_failure,
     format_error,
     format_model_label,
     format_oversized_artifact_notice,
+    format_upstream_cooldown_notice,
+    format_upstream_retry_notice,
     get_session_dir,
     is_dangerous,
+    is_upstream_throttle_reply,
     load_prefs,
     path_is_under,
     save_prefs,
     switch_backend_prefs,
+    upstream_guard,
     validate_add_dir,
 )
 from .update_check import update_check_loop, maybe_notify_admin, format_update_hint
@@ -135,6 +141,259 @@ async def _run_llm(prompt: str, user_id: str) -> tuple[str, list]:
     else:
         from .agy import run_agy
         return await run_agy(prompt, user_id)
+
+
+# ---------------------------------------------------------------------------
+# Global concurrency slot helpers
+#
+# C (user gap) / B (global cooldown) / A (retry backoff) must not hold the
+# global semaphore while sleeping — otherwise multi-user throttle piles up
+# every concurrent slot on asyncio.sleep. Slot is bound via ContextVar from
+# _safe_process_message; when absent (unit tests), sleep is plain.
+#
+# After releasing the slot for sleep we re-acquire with a short timeout and
+# limited retries. Under full slots with long tasks the user may wait a bit
+# longer overall, but that is better than sleeping while holding the slot;
+# final timeout surfaces the same friendly busy reply as initial fail-fast.
+# ---------------------------------------------------------------------------
+
+# Same copy as the initial fail-fast busy reply (concurrency full).
+_BUSY_USER_TEXT = (
+    "⏳ **现在有点忙** ⏳\n\n"
+    "同时处理的消息太多，请过几秒再发。"
+)
+
+
+class SlotReacquireTimeout(Exception):
+    """Global concurrency slot could not be re-acquired after a released sleep."""
+
+
+class _GlobalSlot:
+    """Tracks whether the current task holds the process-wide concurrency slot."""
+
+    __slots__ = ("sem", "held")
+
+    def __init__(self, sem: asyncio.Semaphore) -> None:
+        self.sem = sem
+        self.held = True
+
+    async def _reacquire(self) -> None:
+        """Re-acquire the global slot with short timeout + limited retries.
+
+        Leaves ``held=False`` and raises ``SlotReacquireTimeout`` on final
+        failure so the outer ``_safe_process_message`` finally does not
+        double-release a slot we no longer own.
+        """
+        # Defaults match fail-fast spirit; patchable via config for tests/ops.
+        timeout = float(getattr(config, "slot_reacquire_timeout", 0.5) or 0.5)
+        attempts = max(1, int(getattr(config, "slot_reacquire_attempts", 3) or 3))
+        last_exc: BaseException | None = None
+        for i in range(attempts):
+            try:
+                await asyncio.wait_for(self.sem.acquire(), timeout=timeout)
+                self.held = True
+                return
+            except asyncio.TimeoutError as e:
+                last_exc = e
+                logger.warning(
+                    "global slot re-acquire timeout attempt=%d/%d timeout=%.2fs",
+                    i + 1, attempts, timeout,
+                )
+        # held stays False — we released before sleep and never got it back
+        raise SlotReacquireTimeout(
+            f"failed to re-acquire global slot after {attempts} attempt(s)"
+        ) from last_exc
+
+    async def sleep_released(self, seconds: float) -> None:
+        """Sleep without occupying the global slot; re-acquire afterwards.
+
+        Re-acquire is time-bounded (see ``_reacquire``). On timeout, raises
+        ``SlotReacquireTimeout`` with ``held=False`` so callers can return a
+        friendly busy reply and the outer finally will not double-release.
+        """
+        if seconds <= 0:
+            return
+        if self.held:
+            self.sem.release()
+            self.held = False
+            try:
+                await asyncio.sleep(seconds)
+            finally:
+                # Re-acquire even if cancelled so finally of _safe_process_message
+                # does not double-release a slot we no longer own. Timeout → raise
+                # with held=False (no leak, no double release).
+                await self._reacquire()
+        else:
+            await asyncio.sleep(seconds)
+
+
+_global_slot_ctx: contextvars.ContextVar = contextvars.ContextVar(
+    "wechatbridge_global_slot", default=None
+)
+
+
+async def _guard_sleep(seconds: float) -> None:
+    """Sleep; if this task holds the global slot, release it for the wait."""
+    if seconds <= 0:
+        return
+    slot = _global_slot_ctx.get()
+    if slot is not None:
+        await slot.sleep_released(seconds)
+    else:
+        await asyncio.sleep(seconds)
+
+
+async def _await_upstream_preflight(client, from_user: str, context_token: str) -> None:
+    """C + B waits *before* acquiring the global concurrency slot.
+
+    Called from _safe_process_message under the per-user lock so same-user
+    stays serial, but other users can use free slots while we cool down.
+    B still needs *client* to send the 🔔 cooldown notice.
+    """
+    # C: same-user min interval after throttle — silent, no WeChat notice
+    gap = upstream_guard.user_gap_remaining(from_user)
+    if gap > 0:
+        logger.info(
+            "upstream_user_gap user=%s wait=%.1fs (pre-slot)",
+            from_user, gap,
+        )
+        await asyncio.sleep(gap)
+
+    # B: process-wide cooldown — notify, then wait out remaining time
+    cool = upstream_guard.global_remaining()
+    if cool > 0:
+        secs = max(1, int(round(cool)))
+        logger.info(
+            "upstream_global_cooldown user=%s wait=%.1fs (pre-slot)",
+            from_user, cool,
+        )
+        if context_token and from_user:
+            try:
+                await client.send_message(
+                    to_user_id=from_user,
+                    text=format_upstream_cooldown_notice(secs),
+                    context_token=context_token,
+                    baseurl=client.state.baseurl,
+                    bot_token=client.state.bot_token,
+                )
+            except Exception as e:
+                logger.warning("发送上游冷却提示失败: %s", e)
+        await asyncio.sleep(cool)
+
+
+async def _run_llm_with_guard(
+    client,
+    from_user: str,
+    context_token: str,
+    prompt: str,
+) -> tuple[str, list]:
+    """Run LLM with process-wide upstream throttle / jitter protection.
+
+    Covers all three backends (agy / grok / codex) because they share
+    ``_run_llm`` dispatch. Behaviour (user-facing):
+
+    - **C** per-user gap after a prior throttle: silent sleep (prefer pre-slot)
+    - **B** global cooldown: 🔔 notice then sleep (prefer pre-slot)
+    - **A** on short-window throttle: 🔔 retry notice + backoff, up to retry_max
+    - **额度相关**: mark cooldown/gap but default 0 extra retries (no CLI spam)
+    - Final throttle text is returned as-is (already 🔔 formatted)
+
+    Sleeps use ``_guard_sleep`` so they do not occupy the global concurrency
+    slot when one is held. Pure local slash commands must not call this helper.
+    """
+    # C/B safety net (normally already drained by _await_upstream_preflight
+    # before the global slot was acquired; remaining ≈ 0 in the common path).
+    # Use _guard_sleep so a rare race that re-extends cooldown does not hold
+    # a concurrent slot during the wait.
+    try:
+        gap = upstream_guard.user_gap_remaining(from_user)
+        if gap > 0:
+            logger.info(
+                "upstream_user_gap user=%s wait=%.1fs",
+                from_user, gap,
+            )
+            await _guard_sleep(gap)
+
+        cool = upstream_guard.global_remaining()
+        if cool > 0:
+            secs = max(1, int(round(cool)))
+            logger.info(
+                "upstream_global_cooldown user=%s wait=%.1fs",
+                from_user, cool,
+            )
+            # Align with preflight B: notice failure must not abort the wait/retry path
+            if context_token and from_user:
+                try:
+                    await client.send_message(
+                        to_user_id=from_user,
+                        text=format_upstream_cooldown_notice(secs),
+                        context_token=context_token,
+                        baseurl=client.state.baseurl,
+                        bot_token=client.state.bot_token,
+                    )
+                except Exception as e:
+                    logger.warning("发送上游冷却提示失败: %s", e)
+            await _guard_sleep(cool)
+
+        retry_max = max(0, int(getattr(config, "upstream_retry_max", 2) or 0))
+        quota_retry_max = max(0, int(getattr(config, "upstream_quota_retry_max", 0) or 0))
+        backoff = list(getattr(config, "upstream_backoff", None) or [2, 5, 12])
+        if not backoff:
+            backoff = [2, 5, 12]
+        # Loop bound uses the larger budget; per-kind check decides early exit.
+        total_attempts = max(retry_max, quota_retry_max) + 1
+        reply: str = ""
+        artifacts: list = []
+
+        for attempt in range(total_attempts):
+            reply, artifacts = await _run_llm(prompt, from_user)
+            kind = classify_upstream_failure(reply)
+            if kind is None:
+                upstream_guard.clear_user_gap(from_user)
+                return reply, artifacts
+
+            backend = _get_backend(from_user)
+            upstream_guard.mark_throttle(from_user)
+            kind_retry_max = quota_retry_max if kind == "quota" else retry_max
+            logger.warning(
+                "upstream_throttle user=%s attempt=%d/%d backend=%s kind=%s",
+                from_user, attempt + 1, kind_retry_max + 1, backend, kind,
+            )
+
+            if attempt >= kind_retry_max:
+                # No more retries for this kind — surface the formatted reply
+                return reply, artifacts
+
+            # A: tell user we're retrying, then backoff (slot released while sleeping)
+            retry_n = attempt + 1  # 1-based among the extra retries
+            wait = float(backoff[min(attempt, len(backoff) - 1)])
+            if context_token and from_user:
+                try:
+                    await client.send_message(
+                        to_user_id=from_user,
+                        text=format_upstream_retry_notice(retry_n, kind_retry_max),
+                        context_token=context_token,
+                        baseurl=client.state.baseurl,
+                        bot_token=client.state.bot_token,
+                    )
+                except Exception as e:
+                    logger.warning("发送上游重试提示失败: %s", e)
+            logger.info(
+                "upstream_retry_backoff user=%s attempt=%d/%d sleep=%.1fs backend=%s kind=%s",
+                from_user, attempt + 1, kind_retry_max + 1, wait, backend, kind,
+            )
+            if wait > 0:
+                await _guard_sleep(wait)
+
+        return reply, artifacts
+    except SlotReacquireTimeout:
+        # Released slot during C/B/A sleep could not be reclaimed — same user-
+        # facing semantics as concurrency-full fail-fast (do not silent-drop).
+        logger.warning(
+            "global slot re-acquire failed during guard user=%s; returning busy reply",
+            from_user,
+        )
+        return _BUSY_USER_TEXT, []
 
 
 async def _handle_slash(client: ILinkClient, text: str, user_id: str, context_token: str):
@@ -381,7 +640,7 @@ async def gate_and_run(
         )
         logger.warning("[AUDIT] dangerous prompt pending confirmation: user=%s prompt=%.200s", from_user, prompt)
         return None
-    return await _run_llm(prompt, from_user)
+    return await _run_llm_with_guard(client, from_user, context_token, prompt)
 
 
 async def send_artifacts_back(client, from_user, context_token, artifacts) -> None:
@@ -550,7 +809,9 @@ async def process_message(client: ILinkClient, msg: dict) -> None:
             del pending_confirms[from_user]
             if image_media or file_media:
                 logger.info("确认回复携带媒体，媒体部分被忽略 from=%s", from_user)
-            reply, artifacts = await _run_llm(pending["prompt"], from_user)
+            reply, artifacts = await _run_llm_with_guard(
+                client, from_user, context_token, pending["prompt"],
+            )
             # Send reply
             success = await client.send_message(
                 to_user_id=from_user,
@@ -920,8 +1181,12 @@ async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
     Order matters:
       1) Take per-user lock first — same-user messages queue here and do NOT
          hold a global slot while waiting for the previous one.
-      2) Acquire global semaphore only immediately before process_message.
-      3) Fail-fast (short timeout) if global slots are full; release only if held.
+      2) C (user gap) + B (global cooldown, 🔔) wait *before* the global slot,
+         so multi-user throttle sleeps do not occupy concurrent slots.
+      3) Acquire global semaphore only immediately before process_message.
+      4) Fail-fast (short timeout) if global slots are full; release only if held.
+      5) Bind slot into ContextVar so A retry backoff inside the guard can
+         temporarily release/re-acquire without deadlocking user_lock order.
 
     Thus one user can occupy at most one global slot at a time; cross-user
     parallelism is still capped by WECHATBRIDGE_MAX_CONCURRENT.
@@ -929,27 +1194,24 @@ async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
     from_user = msg.get("from_user_id", "")
     context_token = msg.get("context_token", "")
     sem = _get_global_sem()
-    sem_held = False
 
     # Serialize same user first (empty from_user still gets a dedicated lock key)
     if from_user not in user_locks:
         user_locks[from_user] = asyncio.Lock()
 
     async with user_locks[from_user]:
-        # Global slot only after we own the user lock
+        # C/B before global slot — do not sleep while holding a concurrent slot
+        await _await_upstream_preflight(client, from_user, context_token)
+
         try:
             await asyncio.wait_for(sem.acquire(), timeout=0.05)
-            sem_held = True
         except asyncio.TimeoutError:
             logger.warning("并发已满，拒绝处理 from=%s", from_user)
             if context_token and from_user:
                 try:
                     await client.send_message(
                         to_user_id=from_user,
-                        text=(
-                            "⏳ **现在有点忙** ⏳\n\n"
-                            "同时处理的消息太多，请过几秒再发。"
-                        ),
+                        text=_BUSY_USER_TEXT,
                         context_token=context_token,
                         baseurl=client.state.baseurl,
                         bot_token=client.state.bot_token,
@@ -958,13 +1220,19 @@ async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
                     logger.warning("发送繁忙提示失败: %s", e)
             return
 
+        slot = _GlobalSlot(sem)
+        token = _global_slot_ctx.set(slot)
         try:
             await process_message(client, msg)
         except Exception as e:
             logger.exception("处理消息异常 (from=%s): %s", from_user, e)
         finally:
-            if sem_held:
+            _global_slot_ctx.reset(token)
+            # Only release if this task still owns the slot (A backoff may have
+            # temporarily released; sleep_released re-acquires before return).
+            if slot.held:
                 sem.release()
+                slot.held = False
 
 
 # ---------------------------------------------------------------------------

@@ -186,20 +186,64 @@ def clean_output(text: str) -> str:
 # Shown when backend returns successfully but with no display text
 EMPTY_REPLY = "（这次没有文字回复）"
 
+# Titles used for upstream throttle / quota user replies (🔔 notice style).
+# Keep in sync with format_cli_error branches and is_upstream_throttle_reply.
+# Short-window throttle (retryable by default) vs account/daily quota (no spam retry).
+RETRYABLE_THROTTLE_TITLES = (
+    "助手通道繁忙",
+    "请求较多",
+)
+QUOTA_TITLES = (
+    "额度相关",
+)
+THROTTLE_TITLES = RETRYABLE_THROTTLE_TITLES + QUOTA_TITLES
 
-def format_error(title: str, detail: str = "") -> str:
-    """Standard error bubble: header line only, body below.
+# Header of format_error / format_notice: "❌ **title** ❌" or "🔔 **title** 🔔"
+_BRIDGE_BUBBLE_HEADER_RE = re.compile(
+    r"^(?P<mark>[❌🔔])\s+\*\*[^*]+?\*\*\s+(?P=mark)\s*$"
+)
+
+
+def format_error(title: str, detail: str = "", *, emoji: str = "❌") -> str:
+    """Standard error/notice bubble: header line only, body below.
 
     Example:
         ❌ **未登录** ❌
 
         助手尚未登录，请联系管理员。
+
+    ``emoji`` defaults to ❌; pass 🔔 for throttle/notice-style messages.
     """
+    mark = (emoji or "❌").strip() or "❌"
     title = (title or "错误").strip().replace("\n", " ")
     detail = (detail or "").strip()
     if detail:
-        return f"❌ **{title}** ❌\n\n{detail}"
-    return f"❌ **{title}** ❌"
+        return f"{mark} **{title}** {mark}\n\n{detail}"
+    return f"{mark} **{title}** {mark}"
+
+
+def format_notice(title: str, detail: str = "") -> str:
+    """User-facing notice bubble with 🔔 (throttle / cooldown / retry, etc.).
+
+    Example:
+        🔔 **上游繁忙，正在重试** 🔔
+
+        第 1/2 次重试，请稍候…
+    """
+    return format_error(title, detail, emoji="🔔")
+
+
+def is_bridge_formatted_reply(text: str) -> bool:
+    """True if *text* is already a format_error / format_notice bubble.
+
+    Used so backends never re-run format_cli_error on an already-formatted
+    display (which would wash 🔔 throttle copy into a generic ❌ failure),
+    and so zero-exit structured errors count as failed (no mark_initialized).
+    """
+    if not text or not isinstance(text, str):
+        return False
+    header = text.lstrip().split("\n", 1)[0].strip()
+    return bool(_BRIDGE_BUBBLE_HEADER_RE.match(header))
 
 
 def format_oversized_artifact_notice(art_name: str, size_mb: float) -> str:
@@ -282,18 +326,64 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
             "助手尚未登录或凭证失效，请联系管理员处理。",
         )
 
-    # Rate limit / quota
+    # Upstream eligibility / control-plane RESOURCE_EXHAUSTED (short-window throttle).
+    # Typical agy stderr: "Eligibility check failed: RESOURCE_EXHAUSTED (code 429):
+    # Resource has been exhausted (e.g. check quota)." — not daily-quota zero,
+    # not bridge concurrency, not user spam. More specific patterns first.
+    if (
+        "eligibility" in lower
+        or "resource_exhausted" in lower
+        or "resource exhausted" in lower
+    ):
+        return format_notice(
+            "助手通道繁忙",
+            "上游助手通道暂时限流或繁忙，请稍等片刻再试。",
+        )
+
+    # Explicit account / daily quota (after resource-exhausted so "check quota"
+    # in that message does not steal this branch).
+    # Require exceed/limit/daily/… semantics — bare "quota usage report" must not match.
+    if (
+        "quota exceeded" in lower
+        or "quota_exceeded" in lower
+        or "exceeded your quota" in lower
+        or "daily quota" in lower
+        or "usage limit" in lower
+        or (
+            "quota" in lower
+            and (
+                "exceed" in lower
+                or "exhaust" in lower
+                or "limit" in lower
+                or "daily" in lower
+                or "insufficient" in lower
+            )
+        )
+    ):
+        return format_notice(
+            "额度相关",
+            "当前额度或配额可能受限，请稍后再试或联系管理员。",
+        )
+
+    # Explicit rate limit / too many requests (no resource-exhausted wording).
     if (
         "rate limit" in lower
         or "rate_limit" in lower
         or "too many requests" in lower
-        or "quota" in lower
-        or "resource exhausted" in lower
-        or "429" in lower
     ):
-        return format_error(
-            "请求过于频繁",
-            "用得有点多，暂时被限制了，请稍后再试。",
+        return format_notice(
+            "请求较多",
+            "当前请求较多，请稍后再试。",
+        )
+
+    # Bare 429 fallback — word-boundary so "1429" / "x4290" do not match.
+    # Also accept explicit "status 429" / "code 429" forms.
+    if re.search(r"\b429\b", lower) or re.search(
+        r"(?:status|code|http)\s*[:=]?\s*429\b", lower
+    ):
+        return format_notice(
+            "助手通道繁忙",
+            "上游暂时限流或繁忙，请稍等片刻再试。",
         )
 
     # Network
@@ -352,6 +442,101 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
 
     # Unknown: fixed Chinese only — never echo English raw to WeChat users
     return format_error("执行失败", "这次没处理好，请稍后再试。")
+
+
+def is_upstream_throttle_reply(text: str) -> bool:
+    """True if *text* is a bridge-formatted 🔔 throttle/quota user reply.
+
+    Requires a real format_notice bubble (🔔 + **title**) so free-form model
+    replies that merely mention e.g. ``**请求较多**`` do not trigger retry.
+    Covers both short-window throttle and 额度相关 (caller decides retry policy).
+    """
+    if not is_bridge_formatted_reply(text):
+        return False
+    body = text.lstrip()
+    if not body.startswith("🔔"):
+        return False
+    for title in THROTTLE_TITLES:
+        if f"**{title}**" in body:
+            return True
+    return False
+
+
+def is_upstream_quota_reply(text: str) -> bool:
+    """True if *text* is a bridge-formatted 🔔 额度相关 notice (not short-window)."""
+    if not is_upstream_throttle_reply(text):
+        return False
+    return "**额度相关**" in text.lstrip()
+
+
+def classify_upstream_failure(text: str) -> str | None:
+    """Return ``\"throttle\"``, ``\"quota\"``, or None for non-upstream failures."""
+    if not is_upstream_throttle_reply(text):
+        return None
+    if is_upstream_quota_reply(text):
+        return "quota"
+    return "throttle"
+
+
+def format_upstream_retry_notice(retry_n: int, retry_max: int) -> str:
+    """A: mid-flight retry notice (sent before backoff sleep)."""
+    return format_notice(
+        "上游繁忙，正在重试",
+        f"第 {retry_n}/{retry_max} 次重试，请稍候…",
+    )
+
+
+def format_upstream_cooldown_notice(seconds: int) -> str:
+    """B: global cooldown notice (sent before waiting out the cooldown)."""
+    secs = max(1, int(seconds))
+    return format_notice(
+        "上游冷却中",
+        f"约 {secs} 秒后自动继续。",
+    )
+
+
+class UpstreamGuard:
+    """Process-wide upstream throttle / jitter state (agy + grok + codex).
+
+    - global_cooldown_until: after any throttle, cool the whole process
+    - user_gap_until: after a user's throttle, silent min interval for that user
+    """
+
+    def __init__(self) -> None:
+        self.global_cooldown_until: float = 0.0
+        self.user_gap_until: dict = {}
+
+    def mark_throttle(self, user_id: str) -> None:
+        """Record a throttle signal: extend global cooldown + per-user gap."""
+        now = time.time()
+        cooldown = max(0, int(getattr(config, "upstream_cooldown", 20) or 0))
+        user_gap = max(0, int(getattr(config, "upstream_user_gap", 10) or 0))
+        if cooldown:
+            self.global_cooldown_until = max(
+                self.global_cooldown_until, now + cooldown
+            )
+        if user_id and user_gap:
+            prev = self.user_gap_until.get(user_id, 0.0)
+            self.user_gap_until[user_id] = max(prev, now + user_gap)
+
+    def clear_user_gap(self, user_id: str) -> None:
+        """Drop per-user gap after a successful (non-throttle) reply."""
+        if user_id:
+            self.user_gap_until.pop(user_id, None)
+
+    def global_remaining(self) -> float:
+        """Seconds left on the global cooldown (0 if idle)."""
+        return max(0.0, self.global_cooldown_until - time.time())
+
+    def user_gap_remaining(self, user_id: str) -> float:
+        """Seconds left on this user's silent gap (0 if idle)."""
+        if not user_id:
+            return 0.0
+        return max(0.0, self.user_gap_until.get(user_id, 0.0) - time.time())
+
+
+# Shared process-wide guard instance used by main._run_llm_with_guard
+upstream_guard = UpstreamGuard()
 
 
 # ---------------------------------------------------------------------------
