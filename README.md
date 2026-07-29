@@ -219,8 +219,8 @@ See [`deploy/wechatbridge-windows.md`](deploy/wechatbridge-windows.md).
 | `/help` | list supported commands for the active backend |
 | `/backend <agy\|grok\|codex>` | switch CLI backend for this WeChat user (on real change: clears that backend's continuation state — agy/grok flag and codex `thread_id`/resume — so the next turn starts a fresh session; history files may remain until retention cleanup) |
 | `/clear` or `/new` | drop continue flag so the next CLI turn is a new conversation (does not instantly delete history files) |
-| `/model <name>` | set model (validation differs by backend: agy/grok check against the live model list; codex stores the name without verifying, so a typo only surfaces on the next run; see `/models`) |
-| `/models` | list models — agy/grok query the live CLI; codex returns a built-in reference list, not your actual account's models |
+| `/model <name>` | set model (all backends validate against a live list: agy/grok via CLI `models`; codex via `codex debug models` [then `--bundled`]; unknown name or list-fetch failure refuse and do not write prefs; see `/models`) |
+| `/models` | list models — agy/grok/codex all query the live CLI (codex: `debug models`; falls back to a built-in reference note only if the live list cannot be fetched) |
 | `/fast` | set low reasoning effort (**on only** — not a toggle; no “off” command) |
 | `/planning` | set planning mode (**on only** — not a toggle) |
 | `/add-dir <path>` | **agy:** pass `--add-dir` on later runs if path is allowed. **grok:** recorded only; not passed to the CLI yet |

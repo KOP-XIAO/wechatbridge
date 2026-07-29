@@ -219,8 +219,8 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 | `/help` | 按当前后端列出支持指令 |
 | `/backend <agy\|grok\|codex>` | 按微信用户切换 CLI 后端（真切换时清除该后端续聊状态——agy/grok 标记与 codex `thread_id`/resume——下次起新会话；历史文件可能仍在，靠保留策略清理） |
 | `/clear` 或 `/new` | 丢掉续聊标记，下次 CLI 起新对话（不会立刻删除历史文件） |
-| `/model <名称>` | 设模型（校验因后端而异：agy/grok 对照实时模型列表校验；codex 只存名字不校验，填错会在下次运行时才报错） |
-| `/models` | 列出可用模型——agy/grok 向 CLI 实时查询；codex 返回内置参考列表，而非你账户实际可用的模型 |
+| `/model <名称>` | 设模型（各后端均对照实时列表校验：agy/grok 走 CLI `models`；codex 走 `codex debug models`，失败或空再试 `--bundled`；未知名或列表拉取失败则拒绝且不写 prefs；见 `/models`） |
+| `/models` | 列出可用模型——agy/grok/codex 均向 CLI 实时查询（codex：`debug models`；仅在实时列表拉不到时才回退内置参考说明） |
 | `/fast` | 设为低推理开销（**只开不关**，不是来回切换） |
 | `/planning` | 设为 planning 模式（**只开不关**） |
 | `/add-dir <路径>` | **agy：** 校验通过后后续会带 `--add-dir`。**grok：** 只记偏好，暂不传给 CLI |

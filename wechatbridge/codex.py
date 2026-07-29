@@ -21,7 +21,7 @@ from .config import config
 from .runner_common import (
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
-    sanitize_env, terminate_process, update_active_prefs,
+    sanitize_env, terminate_process, update_active_prefs, is_bridge_formatted_reply,
     format_error, format_cli_error, format_model_label, EMPTY_REPLY, validate_add_dir,
 )
 
@@ -776,35 +776,255 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
 # Slash command support
 # ---------------------------------------------------------------------------
 
+async def _run_codex_subcommand(subcmd_args: list, user_id: str) -> str:
+    """Run a short codex subcommand (e.g. ``debug models``) and return cleaned output.
+
+    Timeout is fixed at 30 seconds. Session isolation matches ``run_codex``:
+    per-user ``HOME`` / ``CODEX_HOME``, optional ``CODEX_API_KEY`` refill after
+    ``sanitize_env``.
+    """
+    session_dir = ensure_user_codex(user_id)
+    cmd = [config.codex_binary_path] + list(subcmd_args)
+    process = None
+    try:
+        env = sanitize_env(session_dir)
+        env["CODEX_HOME"] = os.path.join(session_dir, ".codex")
+        env["PAGER"] = "cat"
+        env["CI"] = "true"
+        env["NONINTERACTIVE"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
+        raw_key = os.environ.get("CODEX_API_KEY")
+        if raw_key:
+            env["CODEX_API_KEY"] = raw_key
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            cwd=session_dir,
+            env=env,
+            preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            process.communicate(), timeout=30.0
+        )
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+        if process.returncode != 0:
+            logger.warning(
+                "codex %s exited with code %s",
+                " ".join(subcmd_args),
+                process.returncode,
+            )
+            return format_cli_error(
+                stderr_text or stdout_text or "终端指令执行失败",
+                backend="codex",
+            )
+
+        return clean_output(stdout_text) or EMPTY_REPLY
+
+    except asyncio.TimeoutError:
+        await terminate_process(process, graceful=True)
+        return format_error("查询超时", "查询超时，请稍后再试。")
+    except asyncio.CancelledError:
+        await terminate_process(process, graceful=False)
+        raise
+    except Exception as e:
+        logger.exception("codex subcommand error: %s", e)
+        await terminate_process(process, graceful=False)
+        return format_error(
+            "执行出错",
+            "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
+        )
+
+
+def _parse_codex_models(output: str) -> list[str]:
+    """Loose-parse model slug list from ``codex debug models`` stdout.
+
+    Accepts JSON (any shape with ``slug`` fields, or a ``models`` array of
+    strings/objects) and falls back to line-oriented text (one name per line,
+    optional leading bullets).
+    """
+    if not output or not output.strip():
+        return []
+
+    text = output.strip()
+    models: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str) -> None:
+        name = (name or "").strip()
+        if not name or name in seen:
+            return
+        # Skip obvious non-slug noise
+        if name.startswith(("[", "{", "(", "<")):
+            return
+        if name in (EMPTY_REPLY, "(empty response)"):
+            return
+        seen.add(name)
+        models.append(name)
+
+    def _walk(obj, *, under_models: bool = False) -> None:
+        if isinstance(obj, dict):
+            slug = obj.get("slug")
+            if isinstance(slug, str) and slug.strip():
+                _add(slug)
+            elif under_models:
+                # Inside a models array: accept id/name/model when slug absent
+                for key in ("id", "name", "model"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val.strip():
+                        _add(val)
+                        break
+            # Prefer the conventional "models" key, then recurse the rest
+            if "models" in obj:
+                _walk(obj["models"], under_models=True)
+            for k, v in obj.items():
+                if k == "models":
+                    continue
+                _walk(v, under_models=False)
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, str) and under_models:
+                    _add(item)
+                else:
+                    _walk(item, under_models=under_models)
+
+    # Try full-text JSON first, then per-line JSON (JSONL-ish).
+    try:
+        data = json.loads(text)
+        # Top-level bare list of strings counts as a models array
+        if isinstance(data, list) and data and all(isinstance(x, str) for x in data):
+            _walk(data, under_models=True)
+        else:
+            _walk(data)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or not line.startswith(("{", "[")):
+                continue
+            try:
+                piece = json.loads(line)
+                if isinstance(piece, list) and piece and all(isinstance(x, str) for x in piece):
+                    _walk(piece, under_models=True)
+                else:
+                    _walk(piece)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+
+    if models:
+        return models
+
+    # Line-oriented fallback (only when JSON yielded nothing useful)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Strip common bullets / list markers
+        for prefix in ("* ", "- ", "• ", "· "):
+            if line.startswith(prefix):
+                line = line[len(prefix):].strip()
+                break
+        # Take first token; drop trailing parenthetical notes
+        token = line.split()[0] if line.split() else ""
+        token = token.split("(")[0].strip().rstrip(",;:")
+        if token and not token.endswith(":") and not token.lower().startswith("available"):
+            _add(token)
+
+    return models
+
+
+async def _fetch_codex_model_list(user_id: str) -> list[str] | None:
+    """Return live model slugs, or None if the list cannot be retrieved.
+
+    Tries ``codex debug models`` first, then ``codex debug models --bundled``.
+    Strict: empty / error / bridge-formatted failure → None (caller must not write prefs).
+    """
+    for args in (["debug", "models"], ["debug", "models", "--bundled"]):
+        output = await _run_codex_subcommand(args, user_id)
+        if not output or output.startswith("[error]") or is_bridge_formatted_reply(output):
+            continue
+        if output == EMPTY_REPLY:
+            continue
+        models = _parse_codex_models(output)
+        if models:
+            return models
+    return None
+
+
+def _builtin_codex_models_note() -> str:
+    """Fallback reference list when live ``debug models`` is unavailable."""
+    return (
+        "📋 **codex 可用模型（参考）** 📋\n\n"
+        "暂时无法从本机 `codex debug models` 拉取实时列表，以下为常见模型名，"
+        "以你的 OpenAI 账户实际可用为准：\n\n"
+        "- `gpt-5.1-codex`\n"
+        "- `gpt-5.1`\n"
+        "- `gpt-5-codex`\n"
+        "- `gpt-5`\n"
+        "- `gpt-4.1`\n\n"
+        "请稍后重试 `/models`，或直接 `/model <名称>`（会校验实时列表）。"
+    )
+
+
 async def _cmd_model(args: str, user_id: str) -> str:
-    """Handle /model <name>: store directly (codex has no models subcommand to validate)."""
+    """Handle /model <name>: validate against ``codex debug models``, then save.
+
+    Strict: list fetch failure or unknown name → refuse and do not write prefs.
+    Matching order (same as agy): exact match, then first prefix match.
+    """
     name = args.strip()
     if not name:
         prefs = load_prefs(user_id)
         return (
             "📋 **当前模型** 📋\n\n"
             f"`{format_model_label(prefs.get('model', ''))}`\n\n"
-            "（codex 无列模型子命令，设置不会校验；填错会在下次运行时报错）"
+            "用 `/models` 查看可用模型，`/model <名称>` 切换。"
         )
-    update_active_prefs(user_id, model=name)
-    return (
-        f"✅ **模型已切换** ✅\n\n`{name}`\n\n"
-        "（未校验，填错会在下次运行时报错）"
-    )
+
+    models = await _fetch_codex_model_list(user_id)
+    if models is None:
+        return "❌ **无法获取模型列表** ❌"
+
+    def _apply(model_name: str) -> str:
+        _, embedded = parse_model_effort(model_name)
+        if embedded:
+            update_active_prefs(user_id, model=model_name, effort="")
+        else:
+            update_active_prefs(user_id, model=model_name)
+        return f"✅ **模型已切换** ✅\n\n`{model_name}`"
+
+    # Exact match
+    if name in models:
+        return _apply(name)
+
+    # Prefix match (first hit, same as agy)
+    prefix_matches = [m for m in models if m.startswith(name)]
+    if prefix_matches:
+        return _apply(prefix_matches[0])
+
+    return f"❌ **模型不存在** ❌\n\n`{name}`"
 
 
-def _cmd_models() -> str:
-    """Return a built-in note listing common codex models (no CLI to query)."""
-    return (
-        "📋 **codex 可用模型（参考）** 📋\n\n"
-        "codex 没有 `models` 子命令可供查询，以下为常见模型名，以你的 OpenAI 账户实际可用为准：\n\n"
-        "- `gpt-5.1-codex`\n"
-        "- `gpt-5.1`\n"
-        "- `gpt-5-codex`\n"
-        "- `gpt-5`\n"
-        "- `gpt-4.1`\n\n"
-        "直接 `/model <名称>` 即可；填错会在下次运行时报错。"
-    )
+async def _cmd_models(user_id: str) -> str:
+    """List codex models via live ``debug models``; fall back to built-in note."""
+    models = await _fetch_codex_model_list(user_id)
+    if models is None:
+        return _builtin_codex_models_note()
+
+    lines = [
+        "📋 **codex 可用模型** 📋",
+        "",
+        "（via `codex debug models`）",
+        "",
+    ]
+    for m in models:
+        lines.append(f"- `{m}`")
+    lines.append("")
+    lines.append("用 `/model <名称>` 切换（支持前缀匹配）。")
+    return "\n".join(lines)
 
 
 def _cmd_help() -> str:
@@ -813,8 +1033,8 @@ def _cmd_help() -> str:
         "📋 **wechatbridge 支持指令 (codex)** 📋",
         "",
         "**模型控制**",
-        "- `/model <名称>` — 切换模型（codex 无列模型子命令，直接存名字，未校验）",
-        "- `/models` — 查看常见模型名（内置说明）",
+        "- `/model <名称>` — 切换模型（用 `/models` 查看可用列表）",
+        "- `/models` — 查看可用模型列表",
         "- `/backend <agy|grok|codex>` — 切换助手引擎",
         "",
         "**对话控制**",
@@ -883,7 +1103,7 @@ async def handle_codex_slash_command(text: str, user_id: str) -> str | None:
         return await _cmd_model(args, user_id)
 
     if cmd == "/models":
-        return _cmd_models()
+        return await _cmd_models(user_id)
 
     if cmd == "/add-dir":
         path = args.strip()
