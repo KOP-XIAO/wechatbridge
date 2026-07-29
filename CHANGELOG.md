@@ -5,6 +5,18 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-07-29
+
+### Fixed
+
+- **codex `/model` 严格校验**：切换时通过本机 `codex debug models`（失败或空再试 `--bundled`）拉取模型 slug 列表；精确/前缀匹配成功才写入 prefs。未知模型 → `❌ 模型不存在` 且不写 prefs；列表拉取失败/空/超时 → `❌ 无法获取模型列表` 且不写 prefs（与 agy/grok 一致的严格策略，不再“未校验直接存名字”）。
+
+### Changed
+
+- **codex `/models`**：优先展示实时列表（via `debug models`）；拉取失败时才回退内置参考说明。
+- **codex `/help` 与文档**：去掉「无列模型 / 未校验」旧说法，改为与 agy 类似「用 `/models` 查看」。
+- **`fake_codex` 测试夹具**：支持 `debug models` / `--bundled` 子命令，供校验路径单测与集成测使用。
+
 ## [1.4.2] - 2026-07-28
 
 ### Added

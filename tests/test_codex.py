@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
 import time
 import unittest
 from unittest import mock
+from unittest.mock import AsyncMock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _FIXTURES = os.path.join(_HERE, "fixtures")
@@ -519,23 +521,148 @@ class TestCodexSlash(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_read_codex_thread_id(sd), "")
         self.assertFalse(os.path.exists(os.path.join(sd, ".initialized.codex")))
 
-    async def test_model_unvalidated_stores(self):
+    async def test_model_validated_stores(self):
+        """Known model in live list → switch succeeds and prefs are written."""
         from wechatbridge.codex import handle_codex_slash_command
         from wechatbridge.runner_common import load_prefs
-        reply = await handle_codex_slash_command("/model gpt-5.1-codex", "u-model")
+        from wechatbridge import codex as codex_mod
+
+        with mock.patch.object(
+            codex_mod,
+            "_fetch_codex_model_list",
+            new=AsyncMock(return_value=["gpt-5.1-codex", "gpt-5.1", "gpt-5"]),
+        ):
+            reply = await handle_codex_slash_command("/model gpt-5.1-codex", "u-model")
         self.assertIn("模型已切换", reply)
-        self.assertIn("未校验", reply)
+        self.assertNotIn("未校验", reply)
         self.assertEqual(load_prefs("u-model")["model"], "gpt-5.1-codex")
+
+    async def test_model_unknown_rejects(self):
+        """Unknown model → refuse and prefs unchanged."""
+        from wechatbridge.codex import handle_codex_slash_command
+        from wechatbridge.runner_common import load_prefs, save_prefs
+        from wechatbridge import codex as codex_mod
+
+        uid = "u-model-unknown"
+        save_prefs(uid, {"model": "gpt-5.1", "effort": "", "mode": ""})
+        with mock.patch.object(
+            codex_mod,
+            "_fetch_codex_model_list",
+            new=AsyncMock(return_value=["gpt-5.1-codex", "gpt-5.1"]),
+        ):
+            reply = await handle_codex_slash_command("/model not-a-real-model", uid)
+        self.assertIn("模型不存在", reply)
+        self.assertNotIn("模型已切换", reply)
+        self.assertEqual(load_prefs(uid)["model"], "gpt-5.1")
+
+    async def test_model_list_fail_rejects(self):
+        """List fetch failure → refuse and do not write prefs (strict)."""
+        from wechatbridge.codex import handle_codex_slash_command
+        from wechatbridge.runner_common import load_prefs, save_prefs
+        from wechatbridge import codex as codex_mod
+
+        uid = "u-model-listfail"
+        save_prefs(uid, {"model": "gpt-5", "effort": "", "mode": ""})
+        with mock.patch.object(
+            codex_mod,
+            "_fetch_codex_model_list",
+            new=AsyncMock(return_value=None),
+        ):
+            reply = await handle_codex_slash_command("/model gpt-5.1-codex", uid)
+        self.assertIn("无法获取模型列表", reply)
+        self.assertNotIn("模型已切换", reply)
+        self.assertEqual(load_prefs(uid)["model"], "gpt-5")
+
+    async def test_model_prefix_match(self):
+        """Prefix match takes the first hit (same as agy)."""
+        from wechatbridge.codex import handle_codex_slash_command
+        from wechatbridge.runner_common import load_prefs
+        from wechatbridge import codex as codex_mod
+
+        with mock.patch.object(
+            codex_mod,
+            "_fetch_codex_model_list",
+            new=AsyncMock(return_value=["gpt-5.1-codex", "gpt-5.1", "gpt-5"]),
+        ):
+            reply = await handle_codex_slash_command("/model gpt-5.1", "u-model-prefix")
+        # exact "gpt-5.1" is in list → exact match wins over longer prefixes
+        self.assertIn("模型已切换", reply)
+        self.assertEqual(load_prefs("u-model-prefix")["model"], "gpt-5.1")
+
+        with mock.patch.object(
+            codex_mod,
+            "_fetch_codex_model_list",
+            new=AsyncMock(return_value=["gpt-5.1-codex", "gpt-5-codex"]),
+        ):
+            reply2 = await handle_codex_slash_command("/model gpt-5.1", "u-model-prefix2")
+        self.assertIn("模型已切换", reply2)
+        self.assertEqual(load_prefs("u-model-prefix2")["model"], "gpt-5.1-codex")
 
     async def test_model_empty_shows_current(self):
         from wechatbridge.codex import handle_codex_slash_command
+        from wechatbridge.runner_common import save_prefs
+
+        save_prefs("u-model-empty", {"model": "gpt-5.1-codex", "effort": "", "mode": ""})
         reply = await handle_codex_slash_command("/model", "u-model-empty")
         self.assertIn("当前模型", reply)
-
-    async def test_models_builtin(self):
-        from wechatbridge.codex import handle_codex_slash_command
-        reply = await handle_codex_slash_command("/models", "u-models")
         self.assertIn("gpt-5.1-codex", reply)
+        self.assertNotIn("不会校验", reply)
+        self.assertNotIn("未校验", reply)
+
+    async def test_models_live_list(self):
+        """/models under mock returns the live list."""
+        from wechatbridge.codex import handle_codex_slash_command
+        from wechatbridge import codex as codex_mod
+
+        with mock.patch.object(
+            codex_mod,
+            "_fetch_codex_model_list",
+            new=AsyncMock(return_value=["gpt-5.1-codex", "gpt-5.1"]),
+        ):
+            reply = await handle_codex_slash_command("/models", "u-models")
+        self.assertIn("gpt-5.1-codex", reply)
+        self.assertIn("gpt-5.1", reply)
+        self.assertIn("debug models", reply)
+
+    async def test_models_fallback_builtin(self):
+        """/models falls back to built-in note when live list fails."""
+        from wechatbridge.codex import handle_codex_slash_command
+        from wechatbridge import codex as codex_mod
+
+        with mock.patch.object(
+            codex_mod,
+            "_fetch_codex_model_list",
+            new=AsyncMock(return_value=None),
+        ):
+            reply = await handle_codex_slash_command("/models", "u-models-fb")
+        self.assertIn("参考", reply)
+        self.assertIn("gpt-5.1-codex", reply)
+
+    async def test_parse_codex_models_json_and_lines(self):
+        from wechatbridge.codex import _parse_codex_models
+
+        j = json.dumps({
+            "models": [
+                {"slug": "gpt-5.1-codex"},
+                {"slug": "gpt-5"},
+            ]
+        })
+        self.assertEqual(_parse_codex_models(j), ["gpt-5.1-codex", "gpt-5"])
+
+        nested = json.dumps({
+            "models": [{"slug": "a"}, {"id": "b", "name": "ignored-without-slug-only"}]
+        })
+        # models[] item with slug + item with id (no slug) both accepted
+        self.assertEqual(_parse_codex_models(nested), ["a", "b"])
+
+        # bare string list
+        self.assertEqual(_parse_codex_models(json.dumps(["m1", "m2"])), ["m1", "m2"])
+
+        lines = "* gpt-5.1-codex (default)\n- gpt-5\n"
+        self.assertEqual(_parse_codex_models(lines), ["gpt-5.1-codex", "gpt-5"])
+
+        self.assertEqual(_parse_codex_models(""), [])
+        self.assertEqual(_parse_codex_models("{}"), [])
 
     async def test_fast_and_planning(self):
         from wechatbridge.codex import handle_codex_slash_command

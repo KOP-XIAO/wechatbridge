@@ -52,6 +52,9 @@ the environment each invocation):
                            currently overloaded") and exits 1 (plain turn
                            failure, no fallback since it's a first run).
   timeout       sleeps far longer than the bridge timeout so the caller times out.
+  models_fail   ``debug models`` (and --bundled) exit 1 — list fetch fails.
+  models_empty  ``debug models`` exits 0 with empty models array.
+  models_plain_fail  plain ``debug models`` fails; ``--bundled`` succeeds.
 
 If FAKE_CODEX_LOG is set (path), every invocation appends one line so tests
 can assert exactly how many times (and with what args) the CLI was launched.
@@ -94,6 +97,46 @@ def _write_rollout(session_dir, uuid_str):
         f.write(json.dumps({"type": "thread.started", "thread_id": uuid_str}) + "\n")
 
 
+def _emit_debug_models(bundled=False):
+    """Emit a JSON model list for ``codex debug models`` [/ ``--bundled``].
+
+    Controlled by FAKE_CODEX_MODE:
+      models_fail   → exit 1 (both plain and --bundled)
+      models_empty  → exit 0 with empty models array
+      models_plain_fail → plain fails, --bundled succeeds (tests fallback)
+      (default / others) → exit 0 with a few gpt-* slugs
+    """
+    mode = os.environ.get("FAKE_CODEX_MODE", "ok")
+    if mode == "models_fail":
+        sys.stderr.write("error: failed to list models\n")
+        sys.stderr.flush()
+        return 1
+    if mode == "models_empty":
+        sys.stdout.write(json.dumps({"models": []}) + "\n")
+        sys.stdout.flush()
+        return 0
+    if mode == "models_plain_fail" and not bundled:
+        sys.stderr.write("error: network unavailable\n")
+        sys.stderr.flush()
+        return 1
+
+    payload = {
+        "models": [
+            {"slug": "gpt-5.1-codex", "display_name": "GPT-5.1 Codex"},
+            {"slug": "gpt-5.1", "display_name": "GPT-5.1"},
+            {"slug": "gpt-5-codex", "display_name": "GPT-5 Codex"},
+            {"slug": "gpt-5", "display_name": "GPT-5"},
+            {"slug": "gpt-4.1", "display_name": "GPT-4.1"},
+        ]
+    }
+    if bundled:
+        # Distinct marker so tests can tell --bundled path was used when desired
+        payload["source"] = "bundled"
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     mode = os.environ.get("FAKE_CODEX_MODE", "ok")
@@ -106,6 +149,11 @@ def main():
                 lf.write("invoked mode=%s args=%s\n" % (mode, " ".join(args)))
         except OSError:
             pass
+
+    # ``codex debug models`` / ``codex debug models --bundled`` (no ``exec``)
+    if "debug" in args and "models" in args:
+        bundled = "--bundled" in args
+        return _emit_debug_models(bundled=bundled)
 
     if "exec" in args:
         args = args[args.index("exec") + 1:]

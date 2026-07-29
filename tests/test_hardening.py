@@ -1564,6 +1564,18 @@ class TestModelCmdRejectsBellThrottle(unittest.IsolatedAsyncioTestCase):
         self.assertIn("无法获取模型列表", out)
         self.assertNotIn("模型已切换", out)
 
+    async def test_codex_model_bell_throttle(self):
+        from wechatbridge.runner_common import format_notice
+        from wechatbridge import codex as codex_mod
+
+        thr = format_notice("助手通道繁忙", "上游限流")
+        with mock.patch.object(
+            codex_mod, "_run_codex_subcommand", new=AsyncMock(return_value=thr)
+        ):
+            out = await codex_mod._cmd_model("gpt-5.1-codex", "u-model-codex")
+        self.assertIn("无法获取模型列表", out)
+        self.assertNotIn("模型已切换", out)
+
 
 class TestEnvIntList(unittest.TestCase):
     """#8 optional: _env_int_list boundary cases."""
