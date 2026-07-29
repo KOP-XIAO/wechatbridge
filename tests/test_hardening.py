@@ -399,7 +399,255 @@ class TestSendArtifactsBackCodexAddDirs(unittest.IsolatedAsyncioTestCase):
             # Exactly the two legitimate artifacts are uploaded; the send API is
             # never called for any deleted/file/oob/symlink-escape target.
             self.assertEqual(len(client.send_media.await_args_list), 2)
-            client.send_message.assert_not_awaited()
+
+            # Skipped (whitelist) artifacts get a short Chinese notice — no abs path.
+            self.assertEqual(client.send_message.await_count, 4)
+            for call in client.send_message.await_args_list:
+                text = call.kwargs["text"]
+                self.assertIn("未能发送", text)
+                self.assertNotIn(base, text)
+                self.assertNotIn(session_dir, text)
+                self.assertNotIn(oob, text)
+
+
+class TestAgyExtractArtifactsUnquote(unittest.TestCase):
+    """agy extract_artifacts must URL-decode percent-encoded paths/names."""
+
+    def test_space_and_cjk_percent_encoded(self):
+        from wechatbridge.agy import extract_artifacts
+
+        text = (
+            "here is [my report.pdf](file:///tmp/scratch/my%20report.pdf) "
+            "and [报告.pdf](file:///tmp/scratch/%E6%8A%A5%E5%91%8A.pdf)"
+        )
+        arts = extract_artifacts(text)
+        paths = {p for _, p in arts}
+        names = {n for n, _ in arts}
+        self.assertIn("/tmp/scratch/my report.pdf", paths)
+        self.assertIn("/tmp/scratch/报告.pdf", paths)
+        self.assertIn("my report.pdf", names)
+        self.assertIn("报告.pdf", names)
+        # Encoded forms must not leak into resolved paths
+        for p in paths:
+            self.assertNotIn("%20", p)
+            self.assertNotIn("%E6", p)
+
+
+class TestSendArtifactsBackAgyAddDirs(unittest.IsolatedAsyncioTestCase):
+    """agy must honour validated --add-dir roots at send time (like codex)."""
+
+    async def test_agy_add_dir_artifact_sent(self):
+        from wechatbridge.main import send_artifacts_back
+        from wechatbridge.config import config
+
+        with tempfile.TemporaryDirectory() as base:
+            session_dir = os.path.join(base, "session")
+            os.makedirs(session_dir)
+            scratch = os.path.join(
+                session_dir, ".gemini", "antigravity-cli", "scratch"
+            )
+            os.makedirs(scratch)
+
+            allowed_extra = os.path.join(base, "allowed_extra")
+            os.makedirs(allowed_extra)
+            good_dir = os.path.join(allowed_extra, "proj")
+            os.makedirs(good_dir)
+            good_art = os.path.join(good_dir, "doc.pdf")
+            with open(good_art, "w", encoding="utf-8") as f:
+                f.write("%PDF-1.4 ok")
+
+            scratch_art = os.path.join(scratch, "local.txt")
+            with open(scratch_art, "w", encoding="utf-8") as f:
+                f.write("scratch")
+
+            # out-of-bounds must still be blocked
+            oob = os.path.join(base, "oob")
+            os.makedirs(oob)
+            oob_art = os.path.join(oob, "secret.txt")
+            with open(oob_art, "w", encoding="utf-8") as f:
+                f.write("secret")
+
+            prefs = {"backend": "agy", "add_dirs": [good_dir]}
+            with open(
+                os.path.join(session_dir, "prefs.json"), "w", encoding="utf-8"
+            ) as f:
+                json.dump(prefs, f)
+
+            client = MagicMock()
+            client.state.baseurl = "https://example.test"
+            client.state.bot_token = "tok"
+            client.send_message = AsyncMock(return_value=True)
+            client.send_media = AsyncMock(return_value=True)
+
+            artifacts = [
+                ("doc.pdf", good_art),
+                ("local.txt", scratch_art),
+                ("secret.txt", oob_art),
+            ]
+
+            with mock.patch(
+                "wechatbridge.main.get_session_dir", return_value=session_dir
+            ), mock.patch(
+                "wechatbridge.runner_common.get_session_dir", return_value=session_dir
+            ), mock.patch(
+                "wechatbridge.main._get_backend", return_value="agy"
+            ), mock.patch.object(
+                config, "add_dir_roots", [allowed_extra]
+            ):
+                await send_artifacts_back(
+                    client, "user-1", "ctx-token", artifacts
+                )
+
+            sent = {c.kwargs["path"] for c in client.send_media.await_args_list}
+            self.assertIn(good_art, sent)
+            self.assertIn(scratch_art, sent)
+            self.assertNotIn(oob_art, sent)
+            self.assertEqual(len(client.send_media.await_args_list), 2)
+
+
+class TestMediaTypeForPath(unittest.TestCase):
+    def test_pdf_png_svg(self):
+        from wechatbridge.ilink import media_type_for_path, MEDIA_IMAGE, MEDIA_FILE
+
+        self.assertEqual(media_type_for_path("/tmp/a.pdf"), MEDIA_FILE)
+        self.assertEqual(media_type_for_path("/tmp/a.docx"), MEDIA_FILE)
+        self.assertEqual(media_type_for_path("/tmp/a.xlsx"), MEDIA_FILE)
+        self.assertEqual(media_type_for_path("/tmp/a.txt"), MEDIA_FILE)
+        self.assertEqual(media_type_for_path("/tmp/a.zip"), MEDIA_FILE)
+        self.assertEqual(media_type_for_path("/tmp/a.png"), MEDIA_IMAGE)
+        self.assertEqual(media_type_for_path("/tmp/a.jpg"), MEDIA_IMAGE)
+        self.assertEqual(media_type_for_path("/tmp/a.jpeg"), MEDIA_IMAGE)
+        self.assertEqual(media_type_for_path("/tmp/a.gif"), MEDIA_IMAGE)
+        self.assertEqual(media_type_for_path("/tmp/a.webp"), MEDIA_IMAGE)
+        self.assertEqual(media_type_for_path("/tmp/a.svg"), MEDIA_FILE)
+        self.assertEqual(media_type_for_path("/tmp/a.heic"), MEDIA_FILE)
+        self.assertEqual(media_type_for_path("/tmp/a.bin"), MEDIA_FILE)
+
+
+class TestArtifactSendFailureNotice(unittest.TestCase):
+    def test_helper_no_absolute_path(self):
+        from wechatbridge.runner_common import format_artifact_send_failure_notice
+
+        art_path = "/root/.local/share/wechatbridge/default/sessions/u1/x.pdf"
+        for reason in ("skipped", "not_found", "send_failed", "error"):
+            text = format_artifact_send_failure_notice("x.pdf", reason)
+            self.assertNotIn(art_path, text)
+            self.assertNotIn("/root/", text)
+            self.assertIn("x.pdf", text)
+            self.assertIn("未能发送", text)
+
+    def test_send_failed_notifies_user(self):
+        from wechatbridge.main import send_artifacts_back
+
+        async def _run():
+            with tempfile.TemporaryDirectory() as td:
+                scratch = os.path.join(td, ".gemini", "antigravity-cli", "scratch")
+                os.makedirs(scratch)
+                art = os.path.join(scratch, "report.pdf")
+                with open(art, "w", encoding="utf-8") as f:
+                    f.write("pdf")
+
+                client = MagicMock()
+                client.state.baseurl = "https://example.test"
+                client.state.bot_token = "tok"
+                client.send_message = AsyncMock(return_value=True)
+                client.send_media = AsyncMock(return_value=False)  # send fails
+
+                with mock.patch(
+                    "wechatbridge.main.get_session_dir", return_value=td
+                ), mock.patch(
+                    "wechatbridge.main._get_backend", return_value="agy"
+                ):
+                    await send_artifacts_back(
+                        client, "user-1", "ctx-token", [("report.pdf", art)]
+                    )
+
+                client.send_media.assert_awaited()
+                client.send_message.assert_awaited()
+                text = client.send_message.await_args.kwargs["text"]
+                self.assertIn("report.pdf", text)
+                self.assertIn("未能发送", text)
+                self.assertNotIn(art, text)
+                self.assertNotIn(td, text)
+
+        asyncio.run(_run())
+
+    def test_not_found_notifies_user(self):
+        from wechatbridge.main import send_artifacts_back
+
+        async def _run():
+            with tempfile.TemporaryDirectory() as td:
+                scratch = os.path.join(td, ".gemini", "antigravity-cli", "scratch")
+                os.makedirs(scratch)
+                missing = os.path.join(scratch, "gone.pdf")
+
+                client = MagicMock()
+                client.state.baseurl = "https://example.test"
+                client.state.bot_token = "tok"
+                client.send_message = AsyncMock(return_value=True)
+                client.send_media = AsyncMock(return_value=True)
+
+                with mock.patch(
+                    "wechatbridge.main.get_session_dir", return_value=td
+                ), mock.patch(
+                    "wechatbridge.main._get_backend", return_value="agy"
+                ):
+                    await send_artifacts_back(
+                        client, "user-1", "ctx-token", [("gone.pdf", missing)]
+                    )
+
+                client.send_media.assert_not_awaited()
+                client.send_message.assert_awaited()
+                text = client.send_message.await_args.kwargs["text"]
+                self.assertIn("gone.pdf", text)
+                self.assertIn("未能发送", text)
+                self.assertNotIn(missing, text)
+                self.assertNotIn(td, text)
+
+        asyncio.run(_run())
+
+
+class TestGrokRelativePathArtifacts(unittest.TestCase):
+    """grok relative file_path must join session_dir then abspath (like codex)."""
+
+    def test_relative_path_resolved(self):
+        from wechatbridge.grok import _extract_grok_artifacts
+        import urllib.parse
+
+        with tempfile.TemporaryDirectory() as session_dir:
+            # Create the relative file under session_dir
+            rel_name = "notes/out.txt"
+            abs_file = os.path.join(session_dir, "notes", "out.txt")
+            os.makedirs(os.path.dirname(abs_file))
+            with open(abs_file, "w", encoding="utf-8") as f:
+                f.write("hello")
+
+            # Fake grok chat_history.jsonl layout
+            cwd_encoded = urllib.parse.quote(session_dir, safe="")
+            session_id = "sess-rel-1"
+            hist_dir = os.path.join(
+                session_dir, ".grok", "sessions", cwd_encoded, session_id
+            )
+            os.makedirs(hist_dir)
+            hist = os.path.join(hist_dir, "chat_history.jsonl")
+            line = {
+                "type": "assistant",
+                "tool_calls": [
+                    {
+                        "name": "write",
+                        "arguments": json.dumps({"file_path": rel_name}),
+                    }
+                ],
+            }
+            with open(hist, "w", encoding="utf-8") as f:
+                f.write(json.dumps(line) + "\n")
+
+            arts = _extract_grok_artifacts(session_dir, session_id, since=0.0)
+            self.assertEqual(len(arts), 1)
+            name, path = arts[0]
+            self.assertEqual(name, "out.txt")
+            self.assertEqual(path, os.path.abspath(abs_file))
+            self.assertTrue(os.path.isabs(path))
 
 
 class TestILinkDeliveryAccepted(unittest.TestCase):

@@ -324,18 +324,26 @@ def _extract_grok_artifacts(session_dir: str, session_id: str, since: float = 0.
                                 continue
                         if name in ("write", "edit", "str_replace") and isinstance(args, dict):
                             fp = args.get("file_path", "")
-                            if fp and os.path.isabs(fp):
-                                # 只收录本轮运行期间新写/修改的文件
-                                try:
-                                    if since and os.path.getmtime(fp) < since - 2.0:
-                                        continue
-                                except OSError:
-                                    continue  # 文件已不存在，无需回传
-                                art_name = os.path.basename(fp)
-                                key = (art_name, fp)
-                                if key not in seen:
-                                    seen.add(key)
-                                    artifacts.append(key)
+                            if not fp:
+                                continue
+                            # Relative paths resolve against session_dir (cwd)
+                            if not os.path.isabs(fp):
+                                fp = os.path.join(session_dir, fp)
+                            try:
+                                fp = os.path.abspath(fp)
+                            except (OSError, ValueError):
+                                continue
+                            # 只收录本轮运行期间新写/修改的文件
+                            try:
+                                if since and os.path.getmtime(fp) < since - 2.0:
+                                    continue
+                            except OSError:
+                                continue  # 文件已不存在，无需回传
+                            art_name = os.path.basename(fp)
+                            key = (art_name, fp)
+                            if key not in seen:
+                                seen.add(key)
+                                artifacts.append(key)
     except OSError as e:
         logger.warning("Failed to read chat_history.jsonl: %s", e)
 

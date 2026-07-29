@@ -11,6 +11,7 @@ import shutil
 import signal
 import sys
 import time
+from urllib.parse import unquote
 
 from .config import config
 from .runner_common import (
@@ -32,14 +33,19 @@ def extract_artifacts(text: str) -> list[tuple[str, str]]:
 
     Uses regex ``\\[([^\\]]+)\\](file:///([^)]+))`` to find agy-generated
     artifact references in stdout. Returns deduplicated, order-preserved list.
+
+    Paths and display names are URL-decoded (``urllib.parse.unquote``) so
+    percent-encoded spaces / CJK (e.g. ``my%20report.pdf``, ``%E6%8A%A5%E5%91%8A.pdf``)
+    resolve to real filesystem paths.
     """
     if not text:
         return []
     seen = set()
     result = []
     for match in re.finditer(r"\[([^\]]+)\]\(file:///([^)]+)\)", text):
-        name = match.group(1).split("#")[0]
-        abs_path = "/" + match.group(2).split("#")[0]
+        name = unquote(match.group(1).split("#")[0])
+        path_part = unquote(match.group(2).split("#")[0])
+        abs_path = path_part if path_part.startswith("/") else "/" + path_part
         key = (name, abs_path)
         if key not in seen:
             seen.add(key)

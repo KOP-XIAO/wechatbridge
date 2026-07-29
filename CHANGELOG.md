@@ -5,6 +5,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.4.4] - 2026-07-29
+
+### Fixed
+
+- **三后端文档回传**：agy 对 `file:///` 链接做 URL 解码（空格/中文路径不再漏传）；agy 回传闸门与 codex 一样二次校验 `--add-dir`，合法目录内文档可回微信。
+- **回传失败不再静默**：白名单跳过、文件不存在、发送失败、异常时向用户发中文提示（只显示文件名，不回显服务器绝对路径）；超大文件提示逻辑不变。
+- **媒体类型**：仅 jpeg/png/gif/webp/bmp 走图片消息；svg/heic 等与 pdf/docx/xlsx/txt/zip 等一律走文件消息（带 `file_name`）。
+- **grok 相对路径产物**：`write`/`edit`/`str_replace` 的相对 `file_path` 按 `session_dir` 解析后再提取（对齐 codex）。
+
+### Tests
+
+- 覆盖 unquote、agy add-dir 闸门、MIME→media_type、失败提示无路径泄露、grok 相对路径提取。
+
 ## [1.4.3] - 2026-07-29
 
 ### Fixed

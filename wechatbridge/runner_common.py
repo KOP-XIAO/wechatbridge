@@ -259,6 +259,30 @@ def format_oversized_artifact_notice(art_name: str, size_mb: float) -> str:
     )
 
 
+# Internal reason codes for format_artifact_send_failure_notice
+_ARTIFACT_FAIL_REASONS = {
+    "skipped": "不在允许回传的目录内，已跳过",
+    "not_found": "文件不存在或不是普通文件",
+    "send_failed": "发送失败，请稍后重试",
+    "error": "发送出错，请稍后重试",
+}
+
+
+def format_artifact_send_failure_notice(art_name: str, reason: str) -> str:
+    """User-facing text when an artifact cannot be sent back to WeChat.
+
+    ``reason`` is an internal code: skipped / not_found / send_failed / error.
+    Must never include server absolute paths — only the display name and reason.
+    """
+    name = (art_name or "file").replace("`", "'").strip() or "file"
+    detail = _ARTIFACT_FAIL_REASONS.get(reason) or _ARTIFACT_FAIL_REASONS["error"]
+    return (
+        f"⚠️ **文件未能发送** ⚠️\n\n"
+        f"`{name}`\n"
+        f"{detail}"
+    )
+
+
 def format_cli_error(raw_message: str, *, backend: str = "") -> str:
     """Map backend stderr/JSON error text into a short Chinese user reply.
 

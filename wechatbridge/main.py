@@ -23,6 +23,7 @@ from .runner_common import (
     clean_session_media,
     clear_initialized,
     classify_upstream_failure,
+    format_artifact_send_failure_notice,
     format_error,
     format_model_label,
     format_oversized_artifact_notice,
@@ -646,8 +647,9 @@ async def gate_and_run(
 async def send_artifacts_back(client, from_user, context_token, artifacts) -> None:
     """Filter artifacts: only send back those under per-user session dir.
 
-    For agy: artifacts under .gemini/antigravity-cli/scratch
-    For grok: artifacts under session_dir (cwd where grok ran)
+    For agy: artifacts under .gemini/antigravity-cli/scratch (plus validated --add-dir)
+    For codex: artifacts under session_dir (plus validated --add-dir)
+    For grok: artifacts under session_dir (cwd where grok ran; no add-dir gate)
     """
     session_dir = get_session_dir(from_user)
     backend = _get_backend(from_user)
@@ -659,22 +661,34 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
         # codex runs with cwd=session_dir; file_change paths may also land in
         # user-approved --add-dir roots, so allow those too.
         allowed_root = session_dir
+    else:
+        # agy writes to .gemini/antigravity-cli/scratch under session_dir
+        allowed_root = os.path.join(session_dir, ".gemini", "antigravity-cli", "scratch")
+
+    # codex and agy both support --add-dir; re-verify stored roots at send time.
+    # Only keep roots that currently exist, are real directories, and still
+    # resolve inside the configured allowed roots (session dir + config
+    # add_dir_roots). Deleted dirs, plain files, out-of-bounds paths and
+    # symlink escapes must not become artifact allow roots. Legitimate
+    # directories are kept (and still re-checked against each artifact path
+    # below). session_dir itself is never relaxed. grok does not use add-dir.
+    if backend in ("codex", "agy"):
         prefs = load_prefs(from_user)
-        # Second-factor verification of stored --add-dir roots at send time.
-        # Only keep roots that currently exist, are real directories, and still
-        # resolve inside the configured allowed roots (session dir + config
-        # add_dir_roots). Deleted dirs, plain files, out-of-bounds paths and
-        # symlink escapes must not become artifact allow roots. Legitimate
-        # directories are kept (and still re-checked against each artifact path
-        # below). session_dir itself is never relaxed.
-        add_dirs = []
         for d in prefs.get("add_dirs", []) or []:
             ok, resolved = validate_add_dir(d, from_user)
             if ok:
                 add_dirs.append(resolved)
-    else:
-        # agy writes to .gemini/antigravity-cli/scratch under session_dir
-        allowed_root = os.path.join(session_dir, ".gemini", "antigravity-cli", "scratch")
+
+    async def _notify_failure(name: str, reason: str) -> None:
+        # Never echo server absolute paths to WeChat users
+        await client.send_message(
+            to_user_id=from_user,
+            text=format_artifact_send_failure_notice(name, reason),
+            context_token=context_token,
+            baseurl=client.state.baseurl,
+            bot_token=client.state.bot_token,
+        )
+
     for art_name, art_path in artifacts:
         try:
             # realpath check blocks symlink escape outside allowed root
@@ -686,9 +700,11 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
                         break
                 if not ok_root:
                     logger.debug("skip non-scratch artifact: %s", art_path)
+                    await _notify_failure(art_name, "skipped")
                     continue
             if not os.path.isfile(os.path.realpath(art_path)):
                 logger.warning("Artifact not found: %s", art_path)
+                await _notify_failure(art_name, "not_found")
                 continue
             art_path = os.path.realpath(art_path)
             file_size = os.path.getsize(art_path)
@@ -719,8 +735,13 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
                 logger.info("Artifact sent: %s -> %s", art_name, from_user)
             else:
                 logger.warning("Failed to send artifact: %s", art_name)
+                await _notify_failure(art_name, "send_failed")
         except Exception as e:
             logger.exception("Error sending artifact %s: %s", art_name, e)
+            try:
+                await _notify_failure(art_name, "error")
+            except Exception:
+                logger.exception("Failed to notify user about artifact error: %s", art_name)
 
 
 # ---------------------------------------------------------------------------

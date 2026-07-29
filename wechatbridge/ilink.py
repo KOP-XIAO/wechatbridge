@@ -25,6 +25,30 @@ logger = logging.getLogger("ilink")
 
 ILINK_BASE = config.ilink_base_url.rstrip("/")
 
+# WeChat image_item handles these well; other image/* (svg/heic/…) go as FILE.
+_DISPLAYABLE_IMAGE_MIMES = frozenset({
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+})
+
+MEDIA_IMAGE = 1
+MEDIA_FILE = 3
+
+
+def media_type_for_path(path: str) -> int:
+    """Return MEDIA_IMAGE or MEDIA_FILE for a local path based on guessed MIME.
+
+    Only common displayable raster images use IMAGE; everything else
+    (pdf/doc/xlsx/txt/zip, svg/heic, unknown) uses FILE so file_name is kept.
+    """
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    if mime in _DISPLAYABLE_IMAGE_MIMES:
+        return MEDIA_IMAGE
+    return MEDIA_FILE
+
 
 def ilink_delivery_accepted(ret, message_id) -> bool:
     """Whether an iLink sendmessage JSON body means the message was accepted.
@@ -530,12 +554,8 @@ class ILinkClient:
         ciphertext = _encrypt_aes_ecb(plaintext, aes_key)
         filesize = len(ciphertext)
 
-        # Determine media_type from mime
-        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        if mime.startswith("image/"):
-            media_type = 1  # MEDIA_IMAGE
-        else:
-            media_type = 3  # MEDIA_FILE
+        # Determine media_type from mime (only common rasters → IMAGE)
+        media_type = media_type_for_path(path)
 
         # Get CDN upload URL
         upload_param, upload_full_url = await self.get_upload_url(
