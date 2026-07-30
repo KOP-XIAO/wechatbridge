@@ -51,6 +51,21 @@ the environment each invocation):
   turn_fail     first run emits thread.started then turn.failed("model is
                            currently overloaded") and exits 1 (plain turn
                            failure, no fallback since it's a first run).
+  ok_shell_files  first run emits normal thread+reply JSONL AND writes two
+                           regular files to session_dir (result.txt created during
+                           execution, out.md pre-existing old file).  Tests that
+                           fallback scan collects only the new file.
+  ok_shell_and_file_change  first run emits file_change events AND writes an
+                           additional file via shell.  Tests deduplication.
+  ok_shell_old_files  first run writes two regular files to session_dir but
+                           both have old mtimes (before t0).  Tests that the
+                           fallback scan does NOT collect old files.
+  ok_shell_internal_metadata  first run writes files to session_dir/.codex and
+                           session_dir/.git/  Tests that internal metadata dirs
+                           are excluded.
+  ok_shell_escape   first run creates a symlink in session_dir pointing to
+                           /tmp (outside allowed roots).  Tests symlink escape
+                           exclusion.
   timeout       sleeps far longer than the bridge timeout so the caller times out.
   models_fail   ``debug models`` (and --bundled) exit 1 — list fetch fails.
   models_empty  ``debug models`` exits 0 with empty models array.
@@ -319,6 +334,95 @@ def main():
         )
         sys.stdout.flush()
         return 1
+
+    if mode == "ok_shell_files":
+        # Fallback scan test: emit normal success JSONL AND write files to session_dir.
+        # result.txt is "new" (not in snapshot_before) -> should be collected.
+        # out.md has old mtime -> should NOT be collected.
+        new_id = str(uuid.uuid4())
+        _write_rollout(session_dir, new_id)
+        _emit_thread(new_id, "first(%s): %s" % (new_id[:8], prompt))
+        # New file created during execution
+        with open(os.path.join(session_dir, "result.txt"), "w") as f:
+            f.write("generated content")
+        # Old pre-existing file (mtime before typical t0)
+        old_path = os.path.join(session_dir, "out.md")
+        with open(old_path, "w") as f:
+            f.write("old content")
+        os.utime(old_path, (1000000, 1000000))
+        return 0
+
+    if mode == "ok_shell_and_file_change":
+        # Dedup test: emit file_change for result.txt AND write it via shell.
+        # The file_change should be the authoritative source; fallback should
+        # not add a duplicate.
+        new_id = str(uuid.uuid4())
+        _write_rollout(session_dir, new_id)
+        lines = [
+            json.dumps({"type": "thread.started", "thread_id": new_id}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "done"}}),
+            json.dumps({"type": "item.completed", "item": {
+                "id": "i2", "type": "file_change", "status": "completed",
+                "changes": [{"kind": "add", "path": "result.txt"}]
+            }}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ]
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        with open(os.path.join(session_dir, "result.txt"), "w") as f:
+            f.write("generated content")
+        return 0
+
+    if mode == "ok_shell_old_files":
+        # Old files test: write files with old mtimes. Fallback scan should
+        # not collect them because mtime < t0.
+        new_id = str(uuid.uuid4())
+        _write_rollout(session_dir, new_id)
+        _emit_thread(new_id, "first(%s): %s" % (new_id[:8], prompt))
+        for name in ("old_result.txt", "old_output.md"):
+            p = os.path.join(session_dir, name)
+            with open(p, "w") as f:
+                f.write("old content")
+            os.utime(p, (1000000, 1000000))
+        return 0
+
+    if mode == "ok_shell_internal_metadata":
+        # Internal metadata test: write files to .codex/ and .git/ dirs.
+        # These should be excluded by _EXCLUDED_SCAN_NAMES.
+        new_id = str(uuid.uuid4())
+        _write_rollout(session_dir, new_id)
+        _emit_thread(new_id, "first(%s): %s" % (new_id[:8], prompt))
+        codex_meta = os.path.join(session_dir, ".codex", "meta.json")
+        os.makedirs(os.path.dirname(codex_meta), exist_ok=True)
+        with open(codex_meta, "w") as f:
+            f.write("{}")
+        git_dir = os.path.join(session_dir, ".git", "config")
+        os.makedirs(os.path.dirname(git_dir), exist_ok=True)
+        with open(git_dir, "w") as f:
+            f.write("[core]")
+        # Also a real file that should be collected
+        with open(os.path.join(session_dir, "real_output.txt"), "w") as f:
+            f.write("real output")
+        return 0
+
+    if mode == "ok_shell_escape":
+        # Symlink escape test: create a symlink to /tmp (outside allowed roots).
+        # The fallback scan should NOT follow it.
+        new_id = str(uuid.uuid4())
+        _write_rollout(session_dir, new_id)
+        _emit_thread(new_id, "first(%s): %s" % (new_id[:8], prompt))
+        # Create target file outside session dir
+        target = "/tmp/_codex_escape_test_target.txt"
+        with open(target, "w") as f:
+            f.write("escaped content")
+        # Create symlink inside session dir pointing to target
+        link_path = os.path.join(session_dir, "escaped.txt")
+        try:
+            os.symlink(target, link_path)
+        except OSError:
+            pass  # If symlink fails, test still passes (no file to collect)
+        return 0
 
     new_id = str(uuid.uuid4())
     _write_rollout(session_dir, new_id)

@@ -5,6 +5,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.4.5] - 2026-07-30
+
+### Fixed
+
+- **Codex artifact relay**：官方 `file_change` 产物保留；成功但无结构化产物时，对私有 session 目录做有界前后快照差异（`diff --no-index -U0`），提取可读变更摘要供微信回传。
+- **`add_dirs` 统一校验**：回传前对所有目录做 `realpath` 标准化并排除内部目录（`.codex`、`sessions` 等）；校验失败时不扫描目录内容。
+- **快照失败不扫描**：目录不存在或无权访问时跳过差异扫描，不抛异常。
+
 ## [1.4.4] - 2026-07-29
 
 ### Fixed

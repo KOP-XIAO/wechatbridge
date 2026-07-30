@@ -22,7 +22,7 @@ from .runner_common import (
     sanitize_user_id, get_session_dir, ensure_session_dir, is_first_message, mark_initialized, clear_initialized,
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs, is_bridge_formatted_reply,
-    format_error, format_cli_error, format_model_label, EMPTY_REPLY, validate_add_dir,
+    format_error, format_cli_error, format_model_label, EMPTY_REPLY, validate_add_dir, path_is_under,
 )
 
 logger = logging.getLogger("codex_runner")
@@ -388,6 +388,7 @@ def _build_codex_command(prompt: str, prefs: dict, first: bool, thread_id: str =
         cmd += ["-c", f"model_reasoning_effort={effort}"]
 
     # add_dirs -> each --add-dir (codex 原生支持，比 grok 的"仅记录"强)
+    # add_dirs 已由 _resolve_add_dirs 通过 validate_add_dir 规范化
     for d in prefs.get("add_dirs", []) or []:
         if d:
             cmd += ["--add-dir", d]
@@ -411,7 +412,7 @@ def _collect_codex_artifact(path: str, session_dir: str, since: float, seen: set
     if not os.path.isabs(path):
         path = os.path.join(session_dir, path)
     try:
-        path = os.path.abspath(path)
+        path = os.path.realpath(path)
     except (OSError, ValueError):
         return
     try:
@@ -426,6 +427,75 @@ def _collect_codex_artifact(path: str, session_dir: str, since: float, seen: set
     if key not in seen:
         seen.add(key)
         artifacts.append(key)
+
+
+def _resolve_add_dirs(raw_dirs: list, session_dir: str, user_id: str = "") -> list:
+    """Validate add_dirs via validate_add_dir for command building + fallback scan.
+
+    Calls validate_add_dir once per directory to get resolved realpaths.
+    Ensures consistency between the --add-dir flags passed to Codex and the
+    allowed roots used by the artifact fallback scan.
+    """
+    validated = []
+    for d in raw_dirs or []:
+        if not d:
+            continue
+        try:
+            ok, result = validate_add_dir(d, user_id)
+        except Exception as e:
+            logger.warning("validate_add_dir failed for %s: %s", d, e)
+            continue
+        if ok and result:
+            validated.append(result)
+    return validated
+
+
+_EXCLUDED_SCAN_NAMES = frozenset({".codex", ".git", "__pycache__", "node_modules", "venv", ".venv", "cache", ".cache"})
+
+
+def _snapshot_regular_files(roots: list) -> dict:
+    """Snapshot regular files (path, mtime) under allowed roots for fallback scan.
+
+    Enforces limits: <=200 files, <=50 directories, <=2 seconds. Returns empty
+    dict if any limit is exceeded (never partial results).
+
+    ``os.walk(followlinks=False)`` naturally excludes symlink traversal;
+    ``_EXCLUDED_SCAN_NAMES`` skips internal metadata dirs; only regular files
+    (not dirs/symlinks/special) are collected.
+    """
+    snap = {}
+    t_start = time.monotonic()
+    file_count = 0
+    dir_count = 0
+    _MAX_FILES = 200
+    _MAX_DIRS = 50
+    _MAX_SCAN_TIME = 2.0
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dir_count += 1
+            if dir_count > _MAX_DIRS:
+                return {}
+            if time.monotonic() - t_start > _MAX_SCAN_TIME:
+                return {}
+            # Exclude internal metadata directories in-place
+            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_SCAN_NAMES]
+            for fn in filenames:
+                file_count += 1
+                if file_count > _MAX_FILES:
+                    return {}
+                fp = os.path.join(dirpath, fn)
+                try:
+                    if not os.path.isfile(fp) or os.path.islink(fp):
+                        continue
+                    # Verify candidate is under one of the allowed roots
+                    if not any(path_is_under(fp, r) for r in roots):
+                        continue
+                    snap[fp] = os.path.getmtime(fp)
+                except OSError:
+                    continue
+    return snap
 
 
 def _parse_codex_output(stdout_text: str, session_dir: str, since: float = 0.0) -> tuple:
@@ -561,6 +631,28 @@ def _extract_codex_error_messages(stdout_text: str) -> list:
 # codex CLI execution
 # ---------------------------------------------------------------------------
 
+
+def _collect_fallback_artifacts(session_dir: str, snapshot_before: dict, t0: float) -> list:
+    """Scan session_dir for new files created during codex execution.
+
+    Only runs when: returncode==0, parse_failed==False, no structured artifacts.
+    Scans only session_dir (never add_dirs). Excludes internal metadata dirs.
+    Each candidate realpath is verified to be under session_dir.
+    """
+    _internal_names = {".codex_thread_id"}
+    fallback = []
+    fallback_seen = set()
+    for fp, fmtime in _snapshot_regular_files([session_dir]).items():
+        if fmtime >= t0 and fp not in snapshot_before:
+            name = os.path.basename(fp)
+            if name in _internal_names or name.startswith(".initialized."):
+                continue
+            key = (name, fp)
+            if key not in fallback_seen:
+                fallback_seen.add(key)
+                fallback.append(key)
+    return fallback
+
 async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
     """Execute codex CLI for a given user message.
 
@@ -610,8 +702,14 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
             first = True
 
     prefs = load_prefs(user_id)
+    # 验证并规范化 add_dirs，确保命令构建与 fallback 扫描使用同一批目录
+    validated_add_dirs = _resolve_add_dirs(prefs.get("add_dirs"), session_dir, user_id)
+    prefs["add_dirs"] = validated_add_dirs
     # persona 经 AGENTS.md 由 codex 自动读取，这里无需注入 argv
     cmd = _build_codex_command(prompt, prefs, first, thread_id)
+
+    # 执行前快照现有文件，用于 shell 产物 fallback 扫描（仅 session_dir）
+    snapshot_before = _snapshot_regular_files([session_dir])
 
     if first:
         logger.info("First message for user %s, running: codex exec ...", user_id)
@@ -733,6 +831,12 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
                     mark_initialized(session_dir, backend="codex")
                     if r_thread_id:
                         _write_codex_thread_id(session_dir, r_thread_id)
+                # Fallback: shell 产物扫描（仅重试成功且无结构化 artifacts 时触发）
+                if not r_failed and not r_artifacts:
+                    fallback = _collect_fallback_artifacts(session_dir, snapshot_before, t0)
+                    if fallback:
+                        r_artifacts = fallback
+                        logger.info("Fallback scan collected %d additional files on retry", len(r_artifacts))
                 elapsed = time.time() - t0
                 logger.info(
                     "codex retry done: user=%s elapsed=%.1fs artifacts=%d output=%d chars failed=%s",
@@ -745,6 +849,13 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
             mark_initialized(session_dir, backend="codex")
             if parsed_thread_id:
                 _write_codex_thread_id(session_dir, parsed_thread_id)
+
+        # Fallback: shell 产物扫描（仅在成功且无结构化 artifacts 时触发）
+        if not failed and not artifacts:
+            fallback = _collect_fallback_artifacts(session_dir, snapshot_before, t0)
+            if fallback:
+                artifacts = fallback
+                logger.info("Fallback scan collected %d additional files", len(artifacts))
 
         elapsed = time.time() - t0
         logger.info(

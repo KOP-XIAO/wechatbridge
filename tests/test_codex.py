@@ -908,6 +908,262 @@ class TestCodexRunFakeCli(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(os.path.isfile(os.path.join(sd, ".initialized.codex")))
 
 
+    # --- Fallback scan tests for shell-created artifacts ---
+
+    def test_shell_file_fallback_collects_new_files(self):
+        """ok_shell_files: new file created during execution is collected by fallback."""
+        display, artifacts = self._run("hi", "u-shell-new", mode="ok_shell_files")
+        self.assertIn("first(", display)
+        names = {n for n, _ in artifacts}
+        self.assertIn("result.txt", names, "fallback should collect new file")
+        self.assertNotIn("out.md", names, "old file should NOT be collected")
+        # All artifact paths must be absolute and under session_dir
+        for _n, ap in artifacts:
+            self.assertTrue(os.path.isabs(ap))
+            sd = os.path.join(self.td, _sanitize("u-shell-new"))
+            self.assertTrue(ap.startswith(sd))
+
+    def test_shell_file_fallback_dedup_with_file_change(self):
+        """ok_shell_and_file_change: file_change is authoritative, no duplicate."""
+        display, artifacts = self._run("hi", "u-shell-dedup", mode="ok_shell_and_file_change")
+        names = {n for n, _ in artifacts}
+        # file_change collected result.txt; fallback should NOT add a duplicate
+        self.assertEqual(names.count("result.txt") if hasattr(names, 'count')
+                         else len([n for n in artifacts if n[0] == "result.txt"]),
+                         len([n for n in artifacts if n[0] == "result.txt"]))
+        # Exactly one result.txt in artifacts (from file_change, not fallback)
+        result_entries = [a for a in artifacts if a[0] == "result.txt"]
+        self.assertEqual(len(result_entries), 1, "no duplicate from fallback")
+
+    def test_shell_file_fallback_old_files_not_collected(self):
+        """ok_shell_old_files: files with old mtimes are NOT collected."""
+        display, artifacts = self._run("hi", "u-shell-old", mode="ok_shell_old_files")
+        self.assertIn("first(", display)
+        names = {n for n, _ in artifacts}
+        self.assertNotIn("old_result.txt", names, "old file should not be collected")
+        self.assertNotIn("old_output.md", names, "old file should not be collected")
+
+    def test_shell_file_fallback_internal_metadata_excluded(self):
+        """ok_shell_internal_metadata: .codex/ and .git/ files are excluded."""
+        display, artifacts = self._run("hi", "u-shell-meta", mode="ok_shell_internal_metadata")
+        self.assertIn("first(", display)
+        names = {n for n, _ in artifacts}
+        self.assertIn("real_output.txt", names, "real file should be collected")
+        self.assertNotIn("meta.json", names, ".codex/ metadata should be excluded")
+        self.assertNotIn("config", names, ".git/ file should be excluded")
+        # No path should contain .codex or .git as a directory component
+        for _n, ap in artifacts:
+            parts = ap.split(os.sep)
+            self.assertNotIn(".codex", parts)
+            self.assertNotIn(".git", parts)
+
+    def test_shell_file_fallback_symlink_escape_excluded(self):
+        """ok_shell_escape: symlink pointing outside allowed roots is NOT collected."""
+        display, artifacts = self._run("hi", "u-shell-escape", mode="ok_shell_escape")
+        self.assertIn("first(", display)
+        names = {n for n, _ in artifacts}
+        self.assertNotIn("escaped.txt", names, "symlink escape should be excluded")
+        # Cleanup target
+        try:
+            os.unlink("/tmp/_codex_escape_test_target.txt")
+        except OSError:
+            pass
+
+    def test_fallback_realpath_alias_dedup(self):
+        """Symlink alias to a file collected via file_change: same realpath -> no duplicate."""
+        import os, sys, json, uuid, datetime
+        target = os.path.join(self.td, "_dedup_target.txt")
+        with open(target, "w") as f:
+            f.write("content")
+        link = os.path.join(self.td, "_dedup_alias.txt")
+        os.symlink(target, link)
+
+        # Build a custom shim that: emits file_change for the alias path AND writes the real file.
+        fake = os.path.join(self.td, "_fake_dedup.py")
+        with open(fake, "w") as f:
+            f.write(
+                '#!/usr/bin/env python3\n'
+                'import json, os, sys, uuid, datetime\n'
+                'session_dir = os.getcwd()\n'
+                'new_id = str(uuid.uuid4())\n'
+                'now = datetime.datetime.now()\n'
+                'ts = now.strftime("%Y-%m-%dT%H-%M-%S")\n'
+                'rollout_dir = os.path.join(session_dir, ".codex", "sessions",\n'
+                '    now.strftime("%Y"), now.strftime("%m"), now.strftime("%d"))\n'
+                'os.makedirs(rollout_dir, exist_ok=True)\n'
+                'with open(os.path.join(rollout_dir, f"rollout-{ts}-{new_id}.jsonl"), "w") as fo:\n'
+                '    fo.write(json.dumps({"type": "session_meta", "payload": {"id": new_id}}) + "\\n")\n'
+                '    fo.write(json.dumps({"type": "thread.started", "thread_id": new_id}) + "\\n")\n'
+                'lines = [\n'
+                '    json.dumps({"type": "thread.started", "thread_id": new_id}),\n'
+                '    json.dumps({"type": "turn.started"}),\n'
+                '    json.dumps({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "done"}}),\n'
+                '    json.dumps({"type": "item.completed", "item": {\n'
+                '        "id": "i2", "type": "file_change", "status": "completed",\n'
+                '        "changes": [{"kind": "add", "path": "_dedup_alias.txt"}]\n'
+                '    }}),\n'
+                '    json.dumps({"type": "turn.completed", "usage": {}}),\n'
+                ']\n'
+                'sys.stdout.write("\\n".join(lines) + "\\n")\n'
+                'sys.stdout.flush()\n'
+                'with open(os.path.join(session_dir, "_dedup_target.txt"), "w") as fo:\n'
+                '    fo.write("content")\n'
+                'sys.exit(0)\n'
+            )
+        os.chmod(fake, 0o755)
+        shim = os.path.join(self.td, "_shim_dedup.py")
+        with open(shim, "w") as f:
+            f.write(
+                "#!/usr/bin/env python3\n"
+                "import sys, os\n"
+                f"sys.argv[0] = {fake!r}\n"
+                "sys.argv.insert(0, sys.executable)\n"
+                "os.execv(sys.executable, sys.argv)\n"
+            )
+        os.chmod(shim, 0o755)
+        from wechatbridge.config import config
+        orig = config.codex_binary_path
+        config.codex_binary_path = shim
+        try:
+            display, artifacts = self._run("hi", "u-dedup-realpath")
+            result_entries = [a for a in artifacts if a[0] == "_dedup_target.txt"]
+            self.assertEqual(len(result_entries), 1, "no duplicate from fallback for realpath alias")
+        finally:
+            config.codex_binary_path = orig
+
+    def test_add_dirs_retry_argv_consistent(self):
+        """Retry argv uses same validated add_dirs list as first run."""
+        import os, datetime
+        sd = os.path.join(self.td, _sanitize("u-retry-add"))
+        os.makedirs(sd, exist_ok=True)
+        from wechatbridge.codex import (
+            ensure_user_codex, mark_initialized, _write_codex_thread_id,
+            _has_codex_session,
+        )
+        mark_initialized(sd, backend="codex")
+        tid = "aabbccdd-0000-0000-0000-000000000000"
+        _write_codex_thread_id(sd, tid)
+        now = datetime.datetime.now()
+        rollout_dir = os.path.join(
+            sd, ".codex", "sessions", now.strftime("%Y"),
+            now.strftime("%m"), now.strftime("%d"),
+        )
+        os.makedirs(rollout_dir, exist_ok=True)
+        with open(os.path.join(rollout_dir, f"rollout-x-{tid}.jsonl"), "w") as f:
+            f.write("x")
+        self.assertTrue(_has_codex_session(sd, tid))
+
+        from wechatbridge.runner_common import save_prefs
+        save_prefs("u-retry-add", {"add_dirs": [sd]})
+
+        captured = []
+        from wechatbridge import codex as codex_mod
+
+        async def spawn(*args, **kwargs):
+            captured.append(list(args))
+            cmd_str = str(args)
+            if "resume" in cmd_str:
+                from tests.test_codex import _FakeProc
+                return _FakeProc("", "error: session not found", 1)
+            from tests.test_codex import _FakeProc
+            return _FakeProc(
+                '{"type":"thread.started","thread_id":"new-tid"}\n'
+                '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n',
+                "", 0,
+            )
+
+        with mock.patch("asyncio.create_subprocess_exec", side_effect=spawn):
+            display, _ = asyncio.run(codex_mod.run_codex("hi", "u-retry-add"))
+        self.assertEqual(len(captured), 2)
+        self.assertIn("--add-dir", captured[0])
+        self.assertIn(sd, captured[0])
+        self.assertIn("--add-dir", captured[1])
+        self.assertIn(sd, captured[1])
+
+    def test_fallback_scan_file_limit(self):
+        """When session_dir has >200 regular files, fallback scan returns empty."""
+        sd = os.path.join(self.td, _sanitize("u-file-limit"))
+        os.makedirs(sd, exist_ok=True)
+        for i in range(205):
+            with open(os.path.join(sd, f"f_{i}.txt"), "w") as f:
+                f.write("x")
+        from wechatbridge.codex import _snapshot_regular_files
+        snap = _snapshot_regular_files([sd])
+        self.assertEqual(snap, {}, ">200 files -> empty")
+
+    def test_fallback_scan_dir_limit(self):
+        """When session_dir has >50 subdirectories, fallback scan returns empty."""
+        sd = os.path.join(self.td, _sanitize("u-dir-limit"))
+        os.makedirs(sd, exist_ok=True)
+        for i in range(55):
+            d = os.path.join(sd, f"dir_{i}")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "file.txt"), "w") as f:
+                f.write("x")
+        from wechatbridge.codex import _snapshot_regular_files
+        snap = _snapshot_regular_files([sd])
+        self.assertEqual(snap, {}, ">50 dirs -> empty")
+
+    def test_fallback_scan_timeout(self):
+        """When snapshot takes >2s, fallback scan returns empty."""
+        from wechatbridge import codex as codex_mod
+        original = codex_mod._snapshot_regular_files
+
+        def slow_snapshot(roots):
+            import time
+            time.sleep(2.5)
+            return {"/fake/file.txt": 1.0}
+
+        codex_mod._snapshot_regular_files = slow_snapshot
+        try:
+            display, artifacts = self._run("hi", "u-scan-timeout", mode="ok")
+            self.assertEqual(artifacts, [], "slow snapshot -> empty")
+        finally:
+            codex_mod._snapshot_regular_files = original
+
+    def test_fallback_scan_not_on_failure(self):
+        """Fallback scan must NOT run when process fails."""
+        display, artifacts = self._run("hi", "u-fail-noscan", mode="fail_first")
+        self.assertTrue(display.startswith("❌"))
+        self.assertEqual(artifacts, [])
+
+    def test_fallback_scan_not_on_timeout(self):
+        """Fallback scan must NOT run when process times out."""
+        from wechatbridge import codex as codex_mod
+        display, artifacts = self._run("hi", "u-to-noscan", timeout=1, mode="timeout")
+        self.assertIn("超时", display)
+        self.assertEqual(artifacts, [])
+
+    def test_add_dirs_consistency_between_build_and_scan(self):
+        """add_dirs in command builder and fallback scan use same validated paths."""
+        from wechatbridge import codex as codex_mod
+
+        # Create a real directory that validate_add_dir would accept
+        add_dir = os.path.join(self.td, "validated_workdir")
+        os.makedirs(add_dir, exist_ok=True)
+        # Write a file in add_dir with old mtime (should NOT be collected)
+        old_file = os.path.join(add_dir, "old_in_add.txt")
+        with open(old_file, "w") as f:
+            f.write("old")
+        os.utime(old_file, (1000000, 1000000))
+
+        # Mock validate_add_dir to return the resolved path (simulates valid dir)
+        with mock.patch("wechatbridge.codex.validate_add_dir", return_value=(True, add_dir)):
+            # Manually set prefs with raw add_dir to test resolution
+            from wechatbridge.runner_common import save_prefs, get_session_dir
+            save_prefs("u-add-consistency", {"add_dirs": [add_dir]})
+
+            display, artifacts = self._run("hi", "u-add-consistency")
+            self.assertIn("first(", display)
+            # old_in_add.txt should NOT be in artifacts (old mtime)
+            names = {n for n, _ in artifacts}
+            self.assertNotIn("old_in_add.txt", names)
+
+            # Verify the command used the resolved path
+            sd = os.path.join(self.td, _sanitize("u-add-consistency"))
+            self.assertTrue(os.path.isdir(sd))
+
+
 class TestCodexEnvOverride(unittest.IsolatedAsyncioTestCase):
     """CODEX_HOME must be overridden to session_dir/.codex, beating any global
     CODEX_HOME from the service environment. The retry reuses the same env.
