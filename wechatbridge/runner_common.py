@@ -283,25 +283,65 @@ def format_artifact_send_failure_notice(art_name: str, reason: str) -> str:
     )
 
 
-def format_cli_error(raw_message: str, *, backend: str = "") -> str:
-    """Map backend stderr/JSON error text into a short Chinese user reply.
+def _classify_cli_error(raw_message: str, *, backend: str = "") -> str:
+    """Classify a backend error string into a category label.
 
-    Never put English raw blobs or internal path/env names into user text.
-    Details stay in the server log only.
+    Returns one of:
+      payload_too_large, context_too_large, invalid_argument,
+      auth, resource_exhausted, rate_limit, bare_429, quota,
+      network, timeout, cascade_timeout, permission,
+      session_not_found, model_invalid, command_not_found, not_found,
+      unknown
+
+    This is a pure function (no I/O, no logging).  ``format_cli_error``
+    drives user-facing copy from the category; callers that need the
+    category directly (e.g. structured logging) can use this too.
     """
-    raw = clean_output(raw_message or "") or "未知错误"
+    raw = clean_output(raw_message or "") or ""
     lower = raw.lower()
     backend = (backend or "").strip().lower()
-    logger.info(
-        "format_cli_error backend=%s raw=%.300s",
-        backend or "?",
-        raw,
-    )
 
-    # codex-specific auth/login recognition (backend-scoped, precise).
-    # Only explicit login semantics match, so ordinary API errors, rate
-    # limits and model errors are never misclassified as a login problem.
-    # agy/grok keep using the generic block below (results unchanged).
+    # --- 1. Payload / request body too large (413) --------------------------------
+    # Match explicit payload/body-size phrases first to avoid
+    # catching a bare 413 that appears in dates or path segments.
+    _PAYLOAD_SIZE_RE = re.compile(
+        r"request\s+payload\s+size\s+exceeds\s+the\s+limit"
+        r"|payload\s+too\s+large"
+        r"|request\s+entity\s+too\s+large"
+        r"|content[-\s]?length\s+(?:exceeds|exceeded|is\s+too\s+large)",
+        re.IGNORECASE,
+    )
+    if _PAYLOAD_SIZE_RE.search(lower):
+        return "payload_too_large"
+    # HTTP 413 with surrounding context (status/code/http prefix or JSON \"code\":413)
+    if re.search(
+        r"(?:status|code|http)\s*[:=]?\s*413\b", lower
+    ) or re.search(r'\"code\"\s*:\s*413', lower):
+        return "payload_too_large"
+
+    # --- 2. Context / token limit -------------------------------------------------
+    _CONTEXT_TOKEN_RE = re.compile(
+        r"input\s+token\s+count\s+exceeds\s+the\s+maximum"
+        r"|context\s+length\s+exceeded"
+        r"|maximum\s+context\s+length"
+        r"|context\s+window\s+exceeded"
+        r"|too\s+many\s+tokens"
+        r"|your\s+input\s+context\s+is\s+too\s+long",
+        re.IGNORECASE,
+    )
+    if _CONTEXT_TOKEN_RE.search(lower):
+        return "context_too_large"
+    # INVALID_ARGUMENT or RESOURCE_EXHAUSTED combined with context/token max signals
+    _ISAE = re.compile(r"invalid_argument|resource_exhausted", re.IGNORECASE)
+    _CTX_KW = re.compile(r"context|token|maximum", re.IGNORECASE)
+    if _ISAE.search(lower) and _CTX_KW.search(lower):
+        return "context_too_large"
+
+    # --- 3. Generic INVALID_ARGUMENT (not payload/context) ------------------------
+    if "invalid_argument" in lower:
+        return "invalid_argument"
+
+    # --- 4. Auth / login ----------------------------------------------------------
     if backend == "codex":
         if (
             "codex login" in lower
@@ -326,12 +366,8 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
             or "unauthorized" in lower
             or "401" in lower and ("auth" in lower or "token" in lower or "login" in lower)
         ):
-            return format_error(
-                "未登录",
-                "助手尚未登录或凭证失效，请联系管理员处理。",
-            )
+            return "auth"
 
-    # Auth / login — ops details stay in logs; users contact admin
     if (
         "not signed in" in lower
         or "authenticate" in lower
@@ -345,28 +381,18 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
         or ("xai_api_key" in lower and ("sign" in lower or "login" in lower or "auth" in lower))
         or "api_key" in lower and ("missing" in lower or "invalid" in lower or "required" in lower)
     ):
-        return format_error(
-            "未登录",
-            "助手尚未登录或凭证失效，请联系管理员处理。",
-        )
+        return "auth"
 
-    # Upstream eligibility / control-plane RESOURCE_EXHAUSTED (short-window throttle).
-    # Typical agy stderr: "Eligibility check failed: RESOURCE_EXHAUSTED (code 429):
-    # Resource has been exhausted (e.g. check quota)." — not daily-quota zero,
-    # not bridge concurrency, not user spam. More specific patterns first.
+    # --- 5. Rate limit / quota (RESOURCE_EXHAUSTED without context/token) ---------
+    # Must come AFTER context_too_large so "context/token + RESOURCE_EXHAUSTED"
+    # does not land here.
     if (
         "eligibility" in lower
         or "resource_exhausted" in lower
         or "resource exhausted" in lower
     ):
-        return format_notice(
-            "助手通道繁忙",
-            "上游助手通道暂时限流或繁忙，请稍等片刻再试。",
-        )
+        return "resource_exhausted"
 
-    # Explicit account / daily quota (after resource-exhausted so "check quota"
-    # in that message does not steal this branch).
-    # Require exceed/limit/daily/… semantics — bare "quota usage report" must not match.
     if (
         "quota exceeded" in lower
         or "quota_exceeded" in lower
@@ -384,33 +410,22 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
             )
         )
     ):
-        return format_notice(
-            "额度相关",
-            "当前额度或配额可能受限，请稍后再试或联系管理员。",
-        )
+        return "quota"
 
-    # Explicit rate limit / too many requests (no resource-exhausted wording).
     if (
         "rate limit" in lower
         or "rate_limit" in lower
         or "too many requests" in lower
     ):
-        return format_notice(
-            "请求较多",
-            "当前请求较多，请稍后再试。",
-        )
+        return "rate_limit"
 
     # Bare 429 fallback — word-boundary so "1429" / "x4290" do not match.
-    # Also accept explicit "status 429" / "code 429" forms.
     if re.search(r"\b429\b", lower) or re.search(
         r"(?:status|code|http)\s*[:=]?\s*429\b", lower
     ):
-        return format_notice(
-            "助手通道繁忙",
-            "上游暂时限流或繁忙，请稍等片刻再试。",
-        )
+        return "bare_429"
 
-    # Network
+    # --- 6. Network ---------------------------------------------------------------
     if (
         "connection refused" in lower
         or "connection reset" in lower
@@ -423,26 +438,21 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
         or "fetch failed" in lower
         or "socket hang up" in lower
     ):
-        return format_error("网络错误", "连不上服务，请检查网络后重试。")
+        return "network"
 
-    # Cascade / API hang (agy) — plain language for users
+    # --- 7. Timeout / cascade -----------------------------------------------------
     if "timeout waiting for cascade" in lower or "timeout waiting for response" in lower:
-        return format_error(
-            "模型响应超时",
-            "模型响应超时，请稍后重试或简化指令。",
-        )
-
-    if "permission" in lower and ("denied" in lower or "refuse" in lower or "rejected" in lower):
-        return format_error("权限不足", "没有执行该操作的权限。")
+        return "cascade_timeout"
 
     if "timeout" in lower or "timed out" in lower or "deadline exceeded" in lower:
-        return format_error("超时", "等待响应超时，请稍后重试。")
+        return "timeout"
+
+    # --- 8. Permission / misc specific --------------------------------------------
+    if "permission" in lower and ("denied" in lower or "refuse" in lower or "rejected" in lower):
+        return "permission"
 
     if "no session found" in lower:
-        return format_error(
-            "会话不存在",
-            "上一轮对话记录已过期，请重新发一次消息即可。",
-        )
+        return "session_not_found"
 
     if "model" in lower and (
         "not found" in lower
@@ -453,15 +463,119 @@ def format_cli_error(raw_message: str, *, backend: str = "") -> str:
         or "not supported" in lower
         or "no such" in lower
     ):
-        return format_error("模型无效", "指定的模型不可用，请用 `/models` 查看后重选。")
+        return "model_invalid"
 
     if "command not found" in lower or "not a command" in lower:
+        return "command_not_found"
+
+    if "not found" in lower or "no such file" in lower or "enoent" in lower:
+        return "not_found"
+
+    return "unknown"
+
+
+def format_cli_error(raw_message: str, *, backend: str = "") -> str:
+    """Map backend stderr/JSON error text into a short Chinese user reply.
+
+    Never put English raw blobs or internal path/env names into user text.
+    Details stay in the server log only.
+    """
+    raw = clean_output(raw_message or "") or "未知错误"
+    category = _classify_cli_error(raw, backend=backend)
+    logger.info(
+        "format_cli_error backend=%s category=%s",
+        backend or "?",
+        category,
+    )
+
+    # --- category → user-facing copy -----------------------------------------------
+    if category == "auth":
+        return format_error(
+            "未登录",
+            "助手尚未登录或凭证失效，请联系管理员处理。",
+        )
+
+    if category == "payload_too_large":
+        return format_error(
+            "请求内容过大",
+            (
+                "本次发送的内容超出服务端限制。\n"
+                "如果已续聊很久，请发 /new 开始新会话；\n"
+                "若新会话仍失败，请减少本次文字、图片或文件。"
+            ),
+        )
+
+    if category == "context_too_large":
+        return format_error(
+            "会话内容过长",
+            (
+                "会话累积内容超出模型上下文限制。\n"
+                "请发 /new 开始新会话后重试。"
+            ),
+        )
+
+    if category == "invalid_argument":
+        return format_error(
+            "请求参数无效",
+            "本次输入参数有误，请检查内容后重试。",
+        )
+
+    # --- throttle / quota (🔔 notice style — existing behaviour preserved) ---------
+    if category == "resource_exhausted":
+        return format_notice(
+            "助手通道繁忙",
+            "上游助手通道暂时限流或繁忙，请稍等片刻再试。",
+        )
+
+    if category == "rate_limit":
+        return format_notice(
+            "请求较多",
+            "当前请求较多，请稍后再试。",
+        )
+
+    if category == "bare_429":
+        return format_notice(
+            "助手通道繁忙",
+            "上游暂时限流或繁忙，请稍等片刻再试。",
+        )
+
+    if category == "quota":
+        return format_notice(
+            "额度相关",
+            "当前额度或配额可能受限，请稍后再试或联系管理员。",
+        )
+
+    if category == "network":
+        return format_error("网络错误", "连不上服务，请检查网络后重试。")
+
+    if category == "cascade_timeout":
+        return format_error(
+            "模型响应超时",
+            "模型响应超时，请稍后重试或简化指令。",
+        )
+
+    if category == "permission":
+        return format_error("权限不足", "没有执行该操作的权限。")
+
+    if category == "timeout":
+        return format_error("超时", "等待响应超时，请稍后重试。")
+
+    if category == "session_not_found":
+        return format_error(
+            "会话不存在",
+            "上一轮对话记录已过期，请重新发一次消息即可。",
+        )
+
+    if category == "model_invalid":
+        return format_error("模型无效", "指定的模型不可用，请用 `/models` 查看后重选。")
+
+    if category == "command_not_found":
         return format_error(
             "助手不可用",
             "助手程序未正确安装或配置，请联系管理员。",
         )
 
-    if "not found" in lower or "no such file" in lower or "enoent" in lower:
+    if category == "not_found":
         return format_error("未找到", "请求的资源或文件不存在。")
 
     # Unknown: fixed Chinese only — never echo English raw to WeChat users

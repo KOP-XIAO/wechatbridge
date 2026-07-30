@@ -5,6 +5,16 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.4.6] - 2026-07-30
+
+### Fixed
+
+- **Oversized payload/request body errors**：payload/request body 过大（HTTP 413 等）时向用户提示「请求内容过大」并引导发 `/new` 开始新会话，不再显示原始英文错误。
+- **Context/token 超限**：会话内容超出模型上下文窗口限制时提示「会话内容过长」并引导 `/new`，不再自动清会话或重放。
+- **Generic `INVALID_ARGUMENT`**：非 payload/context 类的 `INVALID_ARGUMENT` 错误统一提示「请求参数无效」，不再透出原始英文。
+- **Error logging**：`format_cli_error` 日志改为只记录 category 分类（如 `category=payload_too_large`），不再记录原始错误文本，避免日志泄露敏感信息。
+- **Error classification refactor**：新增 `_classify_cli_error` 纯函数，将错误分类逻辑从用户面向文案中解耦，方便单测覆盖和后续扩展。
+
 ## [1.4.5] - 2026-07-30
 
 ### Fixed

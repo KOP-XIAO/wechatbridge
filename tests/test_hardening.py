@@ -1890,3 +1890,450 @@ class TestPreflightBeforeSlot(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestClassifyCliError(unittest.TestCase):
+    """_classify_cli_error returns correct category for each error pattern."""
+
+    def _cat(self, raw: str, backend: str = "agy") -> str:
+        from wechatbridge.runner_common import _classify_cli_error
+        return _classify_cli_error(raw, backend=backend)
+
+    def _fmt(self, raw: str, backend: str = "agy") -> str:
+        from wechatbridge.runner_common import format_cli_error
+        return format_cli_error(raw, backend=backend)
+
+    # --- payload_too_large --------------------------------------------------------
+
+    def test_request_payload_size_exceeds(self):
+        self.assertEqual(self._cat("request payload size exceeds the limit"), "payload_too_large")
+
+    def test_payload_too_large(self):
+        self.assertEqual(self._cat("payload too large"), "payload_too_large")
+
+    def test_request_entity_too_large(self):
+        self.assertEqual(self._cat("Request Entity Too Large"), "payload_too_large")
+
+    def test_content_length_exceeds(self):
+        self.assertEqual(self._cat("Content-Length exceeds the limit of 8MB"), "payload_too_large")
+
+    def test_content_length_is_too_large(self):
+        self.assertEqual(self._cat("content length is too large"), "payload_too_large")
+
+    def test_http_status_413_explicit(self):
+        self.assertEqual(self._cat("HTTP status 413"), "payload_too_large")
+        self.assertEqual(self._cat("status code 413"), "payload_too_large")
+        self.assertEqual(self._cat("http code 413"), "payload_too_large")
+        self.assertEqual(self._cat("code=413"), "payload_too_large")
+
+    def test_json_code_413(self):
+        self.assertEqual(self._cat('{"code": 413, "message": "too big"}'), "payload_too_large")
+
+    def test_413_in_date_not_matched(self):
+        """A bare 413 in a date string must NOT be classified as payload_too_large."""
+        self.assertNotEqual(self._cat("Session expired on 2024-04-13 at 10:00"), "payload_too_large")
+
+    def test_413_in_path_not_matched(self):
+        """A bare 413 in a file path or directory name must NOT match."""
+        self.assertNotEqual(self._cat("file not found: /tmp/record-413.txt"), "payload_too_large")
+
+    def test_413_in_version_not_matched(self):
+        """Version numbers containing 413 must NOT match."""
+        self.assertNotEqual(self._cat("library version 1.413.0"), "payload_too_large")
+
+    # --- context_too_large --------------------------------------------------------
+
+    def test_input_token_count_exceeds(self):
+        self.assertEqual(self._cat("input token count exceeds the maximum"), "context_too_large")
+
+    def test_context_length_exceeded(self):
+        self.assertEqual(self._cat("context length exceeded"), "context_too_large")
+
+    def test_maximum_context_length(self):
+        self.assertEqual(self._cat("maximum context length is 128k tokens"), "context_too_large")
+
+    def test_context_window_exceeded(self):
+        self.assertEqual(self._cat("context window exceeded"), "context_too_large")
+
+    def test_too_many_tokens(self):
+        self.assertEqual(self._cat("too many tokens in this conversation"), "context_too_large")
+
+    def test_your_input_context_is_too_long(self):
+        self.assertEqual(self._cat("your input context is too long for this model"), "context_too_large")
+
+    def test_invalid_argument_with_context(self):
+        self.assertEqual(self._cat("INVALID_ARGUMENT: context is too long"), "context_too_large")
+
+    def test_resource_exhausted_with_token(self):
+        self.assertEqual(self._cat("RESOURCE_EXHAUSTED: token limit exceeded"), "context_too_large")
+
+    def test_resource_exhausted_with_maximum(self):
+        self.assertEqual(self._cat("resource_exhausted: maximum context size reached"), "context_too_large")
+
+    # --- invalid_argument (generic) -----------------------------------------------
+
+    def test_generic_invalid_argument(self):
+        self.assertEqual(self._cat("INVALID_ARGUMENT: unknown field xyz"), "invalid_argument")
+
+    def test_invalid_argument_no_context_token(self):
+        self.assertEqual(self._cat("invalid_argument: bad request format"), "invalid_argument")
+
+    # --- auth ---------------------------------------------------------------------
+
+    def test_auth_generic(self):
+        self.assertEqual(self._cat("Not signed in. Please run login --device"), "auth")
+
+    def test_auth_unauthorized(self):
+        self.assertEqual(self._cat("unauthorized access"), "auth")
+
+    def test_auth_401_with_token(self):
+        self.assertEqual(self._cat("401 error: token expired"), "auth")
+
+    def test_auth_codex_specific(self):
+        self.assertEqual(self._cat("codex login required", backend="codex"), "auth")
+
+    def test_auth_codex_api_key(self):
+        self.assertEqual(self._cat("codex_api_key missing", backend="codex"), "auth")
+
+    # --- rate_limit ---------------------------------------------------------------
+
+    def test_eligibility_resource_exhausted(self):
+        self.assertEqual(self._cat("Eligibility check failed: RESOURCE_EXHAUSTED"), "resource_exhausted")
+
+    def test_resource_exhausted_generic(self):
+        self.assertEqual(self._cat("RESOURCE_EXHAUSTED: resource has been exhausted"), "resource_exhausted")
+
+    def test_rate_limit_exceeded(self):
+        self.assertEqual(self._cat("rate limit exceeded, please slow down"), "rate_limit")
+
+    def test_too_many_requests(self):
+        self.assertEqual(self._cat("HTTP 429 Too Many Requests"), "rate_limit")
+
+    def test_bare_429(self):
+        self.assertEqual(self._cat("upstream returned status 429"), "bare_429")
+
+    # --- quota --------------------------------------------------------------------
+
+    def test_quota_exceeded(self):
+        self.assertEqual(self._cat("You exceeded your current quota"), "quota")
+
+    def test_daily_quota(self):
+        self.assertEqual(self._cat("daily quota exceeded"), "quota")
+
+    def test_usage_limit(self):
+        self.assertEqual(self._cat("usage limit reached"), "quota")
+
+    # --- network ------------------------------------------------------------------
+
+    def test_connection_refused(self):
+        self.assertEqual(self._cat("connection refused"), "network")
+
+    def test_connection_reset(self):
+        self.assertEqual(self._cat("connection reset by peer"), "network")
+
+    def test_network_unreachable(self):
+        self.assertEqual(self._cat("network is unreachable"), "network")
+
+    # --- cascade_timeout ----------------------------------------------------------
+
+    def test_cascade_timeout(self):
+        self.assertEqual(self._cat("timeout waiting for cascade"), "cascade_timeout")
+
+    def test_cascade_response_timeout(self):
+        self.assertEqual(self._cat("timeout waiting for response"), "cascade_timeout")
+
+    # --- timeout ------------------------------------------------------------------
+
+    def test_generic_timeout(self):
+        self.assertEqual(self._cat("timeout occurred"), "timeout")
+
+    def test_timed_out(self):
+        self.assertEqual(self._cat("operation timed out"), "timeout")
+
+    def test_deadline_exceeded(self):
+        self.assertEqual(self._cat("deadline exceeded"), "timeout")
+
+    # --- permission ---------------------------------------------------------------
+
+    def test_permission_denied(self):
+        self.assertEqual(self._cat("permission denied"), "permission")
+
+    # --- session_not_found --------------------------------------------------------
+
+    def test_no_session_found(self):
+        self.assertEqual(self._cat("no session found"), "session_not_found")
+
+    # --- model_invalid ------------------------------------------------------------
+
+    def test_model_not_found(self):
+        self.assertEqual(self._cat("model not found"), "model_invalid")
+
+    def test_model_unknown(self):
+        self.assertEqual(self._cat("unknown model xyz"), "model_invalid")
+
+    # --- command_not_found --------------------------------------------------------
+
+    def test_command_not_found(self):
+        self.assertEqual(self._cat("command not found: xyz"), "command_not_found")
+
+    # --- not_found ----------------------------------------------------------------
+
+    def test_not_found_generic(self):
+        self.assertEqual(self._cat("not found"), "not_found")
+
+    def test_enoent(self):
+        self.assertEqual(self._cat("enoent: no such file"), "not_found")
+
+    # --- unknown ------------------------------------------------------------------
+
+    def test_empty_is_unknown(self):
+        self.assertEqual(self._cat(""), "unknown")
+
+    def test_garbage_is_unknown(self):
+        self.assertEqual(self._cat("abc123 random noise"), "unknown")
+
+
+class TestFormatCliErrorCategories(unittest.TestCase):
+    """format_cli_error produces correct user-facing copy for each category."""
+
+    def _fmt(self, raw: str, backend: str = "agy") -> str:
+        from wechatbridge.runner_common import format_cli_error
+        return format_cli_error(raw, backend=backend)
+
+    def test_payload_too_large_title(self):
+        out = self._fmt("request payload size exceeds the limit")
+        self.assertIn("请求内容过大", out)
+        self.assertIn("❌", out)
+        self.assertIn("/new", out)
+
+    def test_context_too_large_title(self):
+        out = self._fmt("context length exceeded")
+        self.assertIn("会话内容过长", out)
+        self.assertIn("❌", out)
+        self.assertIn("/new", out)
+
+    def test_invalid_argument_title(self):
+        out = self._fmt("INVALID_ARGUMENT: bad field")
+        self.assertIn("请求参数无效", out)
+        self.assertIn("❌", out)
+
+    def test_rate_limit_still_notice(self):
+        out = self._fmt("rate limit exceeded")
+        self.assertIn("🔔", out)
+        self.assertIn("请求较多", out)
+
+    def test_quota_still_notice(self):
+        out = self._fmt("quota exceeded")
+        self.assertIn("🔔", out)
+        self.assertIn("额度相关", out)
+
+    def test_auth_still_error(self):
+        out = self._fmt("not signed in")
+        self.assertIn("❌", out)
+        self.assertIn("未登录", out)
+
+    def test_network_still_error(self):
+        out = self._fmt("connection refused")
+        self.assertIn("网络错误", out)
+
+    def test_timeout_still_error(self):
+        out = self._fmt("timeout")
+        self.assertIn("超时", out)
+
+    def test_unknown_still_generic(self):
+        out = self._fmt("something weird happened")
+        self.assertIn("执行失败", out)
+
+
+class TestFormatCliErrorNoRawInReply(unittest.TestCase):
+    """format_cli_error must never echo raw English text to WeChat users."""
+
+    def _fmt(self, raw: str) -> str:
+        from wechatbridge.runner_common import format_cli_error
+        return format_cli_error(raw, backend="agy")
+
+    def test_no_raw_payload_error(self):
+        out = self._fmt("request payload size exceeds the limit")
+        self.assertNotIn("payload", out.lower())
+        self.assertNotIn("request", out.lower())
+
+    def test_no_raw_context_error(self):
+        out = self._fmt("context length exceeded")
+        self.assertNotIn("context", out.lower())
+        self.assertNotIn("exceeded", out.lower())
+
+    def test_no_raw_invalid_argument(self):
+        out = self._fmt("INVALID_ARGUMENT: bad field")
+        self.assertNotIn("INVALID_ARGUMENT", out)
+
+    def test_no_raw_rate_limit(self):
+        out = self._fmt("rate limit exceeded")
+        self.assertNotIn("rate", out.lower())
+        self.assertNotIn("limit", out.lower())
+
+
+class TestFormatCliErrorLogging(unittest.TestCase):
+    """format_cli_error logs category, not raw text."""
+
+    def test_log_contains_category_not_raw(self):
+        from wechatbridge.runner_common import format_cli_error, _classify_cli_error
+        import logging
+        import io
+
+        # First, verify the category is correct
+        category = _classify_cli_error("request payload size exceeds the limit")
+        self.assertEqual(category, "payload_too_large")
+
+        # Capture log output — set logger level to INFO so our info() call propagates
+        log_capture = io.StringIO()
+        handler = logging.StreamHandler(log_capture)
+        handler.setLevel(logging.DEBUG)
+        logger = logging.getLogger("wechatbridge.runner")
+        old_level = logger.level
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+        try:
+            format_cli_error("request payload size exceeds the limit", backend="agy")
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+
+        log_output = log_capture.getvalue()
+        self.assertIn("category=payload_too_large", log_output)
+        # Verify raw text is NOT in the log
+        self.assertNotIn("request payload", log_output)
+
+    def test_category_independent_of_raw(self):
+        """_classify_cli_error is a pure function; verify it directly."""
+        from wechatbridge.runner_common import _classify_cli_error
+
+        # payload_too_large
+        self.assertEqual(_classify_cli_error("request payload size exceeds the limit"), "payload_too_large")
+        self.assertEqual(_classify_cli_error("payload too large"), "payload_too_large")
+        # context_too_large
+        self.assertEqual(_classify_cli_error("context length exceeded"), "context_too_large")
+        self.assertEqual(_classify_cli_error("too many tokens"), "context_too_large")
+        # invalid_argument
+        self.assertEqual(_classify_cli_error("INVALID_ARGUMENT: bad field"), "invalid_argument")
+        # rate_limit (resource_exhausted without context/token keyword)
+        self.assertEqual(_classify_cli_error("RESOURCE_EXHAUSTED: quota"), "resource_exhausted")
+        # rate_limit (explicit)
+        self.assertEqual(_classify_cli_error("rate limit exceeded"), "rate_limit")
+        # bare 429
+        self.assertEqual(_classify_cli_error("status 429"), "bare_429")
+        # quota
+        self.assertEqual(_classify_cli_error("quota exceeded"), "quota")
+
+
+class TestFormatCliError413Boundary(unittest.TestCase):
+    """413 must not be misclassified when appearing in dates, paths, or versions."""
+
+    def _cat(self, raw: str) -> str:
+        from wechatbridge.runner_common import _classify_cli_error
+        return _classify_cli_error(raw)
+
+    def test_date_with_413(self):
+        self.assertNotEqual(self._cat("2024-04-13T10:00:00"), "payload_too_large")
+
+    def test_path_with_413(self):
+        self.assertNotEqual(self._cat("/tmp/file-413.txt"), "payload_too_large")
+
+    def test_version_with_413(self):
+        self.assertNotEqual(self._cat("version 1.413.2"), "payload_too_large")
+
+    def test_error_code_413_without_prefix(self):
+        """A bare '413' without status/code/http prefix should NOT match."""
+        self.assertNotEqual(self._cat("error 413 occurred"), "payload_too_large")
+
+    def test_explicit_status_413(self):
+        self.assertEqual(self._cat("status 413"), "payload_too_large")
+
+    def test_explicit_code_413(self):
+        self.assertEqual(self._cat("code: 413"), "payload_too_large")
+
+
+class TestFormatCliErrorContextResourceExhausted(unittest.TestCase):
+    """RESOURCE_EXHAUSTED with context/token keywords must classify as context_too_large."""
+
+    def _cat(self, raw: str) -> str:
+        from wechatbridge.runner_common import _classify_cli_error
+        return _classify_cli_error(raw)
+
+    def test_resource_exhausted_with_context(self):
+        self.assertEqual(self._cat("RESOURCE_EXHAUSTED: context length exceeded"), "context_too_large")
+
+    def test_resource_exhausted_with_token(self):
+        self.assertEqual(self._cat("RESOURCE_EXHAUSTED: token limit reached"), "context_too_large")
+
+    def test_resource_exhausted_with_maximum(self):
+        self.assertEqual(self._cat("RESOURCE_EXHAUSTED: maximum context size"), "context_too_large")
+
+    def test_invalid_argument_with_context(self):
+        self.assertEqual(self._cat("INVALID_ARGUMENT: context too long"), "context_too_large")
+
+
+class TestFormatCliErrorPreservesExistingThrottle(unittest.TestCase):
+    """Existing throttle/quota behavior must not be regressed."""
+
+    def _fmt(self, raw: str) -> str:
+        from wechatbridge.runner_common import format_cli_error
+        return format_cli_error(raw, backend="agy")
+
+    def test_eligibility_still_busy(self):
+        out = self._fmt("Eligibility check failed: RESOURCE_EXHAUSTED (code 429)")
+        self.assertIn("助手通道繁忙", out)
+        self.assertIn("🔔", out)
+
+    def test_quota_exceeded_still_quota(self):
+        out = self._fmt("You exceeded your current quota")
+        self.assertIn("额度相关", out)
+        self.assertIn("🔔", out)
+
+    def test_rate_limit_still_busy(self):
+        out = self._fmt("rate limit exceeded")
+        self.assertIn("请求较多", out)
+        self.assertIn("🔔", out)
+
+    def test_bare_429_still_busy(self):
+        out = self._fmt("upstream returned status 429")
+        self.assertIn("助手通道繁忙", out)
+        self.assertIn("🔔", out)
+
+
+class TestClearInitializedPreservesHistory(unittest.TestCase):
+    """clear_initialized must only remove .initialized flags, not conversation history."""
+
+    def test_clear_initialized_only_removes_flags(self):
+        from wechatbridge.runner_common import clear_initialized, ensure_session_dir
+
+        with tempfile.TemporaryDirectory() as td:
+            sd = os.path.join(td, "user_test")
+            os.makedirs(sd, exist_ok=True)
+            # Create .initialized flag
+            flag = os.path.join(sd, ".initialized.agy")
+            with open(flag, "w") as f:
+                f.write("1")
+            # Create some history files
+            history_dir = os.path.join(sd, ".gemini", "antigravity-cli", "conversations")
+            os.makedirs(history_dir, exist_ok=True)
+            history_file = os.path.join(history_dir, "conv.db")
+            with open(history_file, "w") as f:
+                f.write("history data")
+            # Create prefs
+            prefs_file = os.path.join(sd, "prefs.json")
+            with open(prefs_file, "w") as f:
+                f.write("{}")
+
+            clear_initialized(sd, backend="agy")
+
+            # Flag is removed
+            self.assertFalse(os.path.exists(flag))
+            # History is preserved
+            self.assertTrue(os.path.exists(history_file))
+            # Prefs are preserved
+            self.assertTrue(os.path.exists(prefs_file))
+
+
+if __name__ == "__main__":
+    unittest.main()
