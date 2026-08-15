@@ -633,25 +633,51 @@ def _extract_codex_error_messages(stdout_text: str) -> list:
 
 
 def _collect_fallback_artifacts(session_dir: str, snapshot_before: dict, t0: float) -> list:
-    """Scan session_dir for new files created during codex execution.
+    """Scan session_dir for files created or overwritten during this turn.
 
-    Only runs when: returncode==0, parse_failed==False, no structured artifacts.
-    Scans only session_dir (never add_dirs). Excludes internal metadata dirs.
-    Each candidate realpath is verified to be under session_dir.
+    Codex often emits a ``file_change`` for a helper script and then writes
+    the real pdf/docx via the shell. Always merge this list with structured
+    artifacts (dedupe by realpath). Scans only session_dir (never add_dirs).
+    Excludes internal metadata dirs. Each candidate is verified under session_dir.
     """
     _internal_names = {".codex_thread_id"}
     fallback = []
     fallback_seen = set()
     for fp, fmtime in _snapshot_regular_files([session_dir]).items():
-        if fmtime >= t0 and fp not in snapshot_before:
-            name = os.path.basename(fp)
-            if name in _internal_names or name.startswith(".initialized."):
+        prev = snapshot_before.get(fp)
+        if prev is None:
+            if fmtime < t0:
                 continue
-            key = (name, fp)
-            if key not in fallback_seen:
-                fallback_seen.add(key)
-                fallback.append(key)
+        elif fmtime <= prev:
+            continue
+        name = os.path.basename(fp)
+        if name in _internal_names or name.startswith(".initialized."):
+            continue
+        key = (name, fp)
+        if key not in fallback_seen:
+            fallback_seen.add(key)
+            fallback.append(key)
     return fallback
+
+
+def _merge_codex_artifacts(*groups) -> list:
+    """Dedupe (name, path) tuples by realpath, preserve first-seen order."""
+    merged = []
+    seen = set()
+    for group in groups:
+        for item in group or []:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                continue
+            name, path = item
+            try:
+                key = os.path.realpath(path)
+            except OSError:
+                key = path
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((name, path))
+    return merged
 
 async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
     """Execute codex CLI for a given user message.
@@ -831,12 +857,18 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
                     mark_initialized(session_dir, backend="codex")
                     if r_thread_id:
                         _write_codex_thread_id(session_dir, r_thread_id)
-                # Fallback: shell 产物扫描（仅重试成功且无结构化 artifacts 时触发）
-                if not r_failed and not r_artifacts:
-                    fallback = _collect_fallback_artifacts(session_dir, snapshot_before, t0)
-                    if fallback:
-                        r_artifacts = fallback
-                        logger.info("Fallback scan collected %d additional files on retry", len(r_artifacts))
+                # Fallback: 重试成功也扫本轮新建/覆盖的文件，与 file_change 合并
+                if not r_failed:
+                    extra = _collect_fallback_artifacts(session_dir, snapshot_before, t0)
+                    if extra:
+                        before = len(r_artifacts)
+                        r_artifacts = _merge_codex_artifacts(r_artifacts, extra)
+                        added = len(r_artifacts) - before
+                        if added:
+                            logger.info(
+                                "Fallback scan collected %d additional files on retry",
+                                added,
+                            )
                 elapsed = time.time() - t0
                 logger.info(
                     "codex retry done: user=%s elapsed=%.1fs artifacts=%d output=%d chars failed=%s",
@@ -850,12 +882,16 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
             if parsed_thread_id:
                 _write_codex_thread_id(session_dir, parsed_thread_id)
 
-        # Fallback: shell 产物扫描（仅在成功且无结构化 artifacts 时触发）
-        if not failed and not artifacts:
-            fallback = _collect_fallback_artifacts(session_dir, snapshot_before, t0)
-            if fallback:
-                artifacts = fallback
-                logger.info("Fallback scan collected %d additional files", len(artifacts))
+        # Fallback: 成功就扫本轮新建/覆盖的文件，与 file_change 合并去重。
+        # 不能再要求 artifacts 为空——先写出脚本再终端生成 pdf 时会漏文档。
+        if not failed:
+            extra = _collect_fallback_artifacts(session_dir, snapshot_before, t0)
+            if extra:
+                before = len(artifacts)
+                artifacts = _merge_codex_artifacts(artifacts, extra)
+                added = len(artifacts) - before
+                if added:
+                    logger.info("Fallback scan collected %d additional files", added)
 
         elapsed = time.time() - t0
         logger.info(

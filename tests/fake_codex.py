@@ -57,6 +57,8 @@ the environment each invocation):
                            fallback scan collects only the new file.
   ok_shell_and_file_change  first run emits file_change events AND writes an
                            additional file via shell.  Tests deduplication.
+  ok_shell_mixed_docs  file_change for helper.py AND a shell-written report.pdf.
+                           Tests merge: structured + extra document.
   ok_shell_old_files  first run writes two regular files to session_dir but
                            both have old mtimes (before t0).  Tests that the
                            fallback scan does NOT collect old files.
@@ -372,6 +374,29 @@ def main():
         sys.stdout.flush()
         with open(os.path.join(session_dir, "result.txt"), "w") as f:
             f.write("generated content")
+        return 0
+
+    if mode == "ok_shell_mixed_docs":
+        # Mixed: file_change reports helper.py; the real document is only
+        # written via the shell. Both must come back.
+        new_id = str(uuid.uuid4())
+        _write_rollout(session_dir, new_id)
+        lines = [
+            json.dumps({"type": "thread.started", "thread_id": new_id}),
+            json.dumps({"type": "turn.started"}),
+            json.dumps({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": "done"}}),
+            json.dumps({"type": "item.completed", "item": {
+                "id": "i2", "type": "file_change", "status": "completed",
+                "changes": [{"kind": "add", "path": "helper.py"}]
+            }}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ]
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        with open(os.path.join(session_dir, "helper.py"), "w") as f:
+            f.write("print('ok')\n")
+        with open(os.path.join(session_dir, "report.pdf"), "wb") as f:
+            f.write(b"%PDF-1.4")
         return 0
 
     if mode == "ok_shell_old_files":

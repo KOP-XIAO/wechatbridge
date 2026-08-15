@@ -935,6 +935,34 @@ class TestCodexRunFakeCli(unittest.IsolatedAsyncioTestCase):
         result_entries = [a for a in artifacts if a[0] == "result.txt"]
         self.assertEqual(len(result_entries), 1, "no duplicate from fallback")
 
+    def test_shell_pdf_merged_with_file_change(self):
+        """file_change for helper.py plus a shell-written report.pdf — both return."""
+        display, artifacts = self._run("hi", "u-shell-mix", mode="ok_shell_mixed_docs")
+        self.assertEqual(display, "done")
+        names = {n for n, _ in artifacts}
+        self.assertIn("helper.py", names)
+        self.assertIn("report.pdf", names)
+        self.assertEqual(len([a for a in artifacts if a[0] == "helper.py"]), 1)
+        self.assertEqual(len([a for a in artifacts if a[0] == "report.pdf"]), 1)
+
+    def test_shell_overwrite_existing_pdf(self):
+        """Rewriting a pre-existing pdf must still collect it."""
+        from wechatbridge.runner_common import sanitize_user_id
+
+        uid = "u-shell-ow"
+        sd = os.path.join(self.td, sanitize_user_id(uid))
+        os.makedirs(sd)
+        pdf = os.path.join(sd, "report.pdf")
+        with open(pdf, "wb") as f:
+            f.write(b"%PDF-old")
+        os.utime(pdf, (1_000_000, 1_000_000))
+        display, artifacts = self._run("hi", uid, mode="ok_shell_mixed_docs")
+        self.assertEqual(display, "done")
+        names = {n for n, _ in artifacts}
+        self.assertIn("report.pdf", names)
+        with open(pdf, "rb") as f:
+            self.assertEqual(f.read(), b"%PDF-1.4")
+
     def test_shell_file_fallback_old_files_not_collected(self):
         """ok_shell_old_files: files with old mtimes are NOT collected."""
         display, artifacts = self._run("hi", "u-shell-old", mode="ok_shell_old_files")

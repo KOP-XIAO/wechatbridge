@@ -5,6 +5,16 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.4.8] - 2026-08-15
+
+### Fixed
+
+- **Codex 文档回传**：成功回合不再要求「没有任何 `file_change`」才扫会话目录。先写出脚本再用终端生成 pdf/docx 时，文档会和结构化产物合并去重后回传；覆盖已有文档也会收。仍只扫 `session_dir`，不扫 `--add-dir`，认证逻辑未改。
+
+### Tests
+
+- `ok_shell_mixed_docs`：`file_change` 的 helper.py + 终端 `report.pdf` 都会进列表；覆盖已有 pdf 也会收。
+
 ## [1.4.7] - 2026-08-15
 
 ### Fixed
