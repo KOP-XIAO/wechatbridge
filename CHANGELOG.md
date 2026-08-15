@@ -5,6 +5,16 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.4.9] - 2026-08-16
+
+### Fixed
+
+- **凭证轮换后第二句必挂（promote 回流）**：grok/codex CLI 刷新 token 用「临时文件+rename」原子写，会把手机会话 `auth.json` 的 symlink 拆成普通文件，新凭证只落在 session，宿主仍是已吊销的旧凭证，下一句 `_sync` 又用旧凭证覆盖 → 第一句过第二句挂。修复：session 普通 `auth.json` 一律视为更新凭证，先原子写回宿主（promote），成功后再重建 symlink；promote 失败（含空文件校验失败）绝不 unlink session 文件；子进程退出后 harvest 回流，覆盖成功/非零退出/超时/取消/`--continue` 重试等所有路径。
+
+### Tests
+
+- 新增 `tests/test_grok_auth.py`、`tests/test_codex_auth.py`：promote 回流与重建链接、CLI rename 拆链后下一句回流、promote 失败保留 session 文件且不覆盖宿主、空文件拒绝覆盖宿主、宿主目录缺失时自动创建（0o700）、run/subcommand 退出后 harvest。
+
 ## [1.4.8] - 2026-08-15
 
 ### Fixed

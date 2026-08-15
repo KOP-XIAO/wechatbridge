@@ -47,13 +47,13 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 ### grok 后端说明
 
 - 隔离：每个微信用户运行时把 `HOME` 指到自己的会话目录，对话状态在会话里；登录态跟机器走。
-- 认证：每用户会话链接宿主 `~/.grok/auth.json`（fallback 为拷贝），复用宿主 `grok login`；也可在桥进程环境设 `XAI_API_KEY`（sanitize 之后会再注入 grok 子进程）。grok-remote 客户端已登录，不等于主机 CLI 已登录。本仓库不存放任何 key / token 值。
+- 认证：每用户会话链接宿主 `~/.grok/auth.json`（fallback 为拷贝），复用宿主 `grok login`；grok CLI 用「临时文件+rename」重写 auth.json 时会把会话 symlink 拆成普通文件，桥会把这类 session 普通文件原子写回宿主（promote）并重建链接，刷新后的新凭证不会被宿主已吊销旧凭证覆盖；也可在桥进程环境设 `XAI_API_KEY`（sanitize 之后会再注入 grok 子进程）。grok-remote 客户端已登录，不等于主机 CLI 已登录。本仓库不存放任何 key / token 值。
 
 ### codex 后端说明
 
 - 每轮以 `codex exec --json` 运行；续聊使用 `codex exec resume <thread_id> <prompt>`，thread id 按用户持久化。
 - 隔离：每个微信用户运行时把 `HOME` 与 `CODEX_HOME` 指到自己的会话目录（`session_dir/.codex`），会话、日志、缓存互不串。
-- 认证：每用户会话链接宿主 `~/.codex/auth.json`（fallback 为拷贝），复用宿主 `codex login`；也可在桥进程环境设 `CODEX_API_KEY` 认证。本仓库不存放任何 key / token 值。
+- 认证：每用户会话链接宿主 `~/.codex/auth.json`（fallback 为拷贝），复用宿主 `codex login`；codex CLI 用「临时文件+rename」重写 auth.json 时会把会话 symlink 拆成普通文件，桥会把这类 session 普通文件原子写回宿主（promote）并重建链接，刷新后的新凭证不会被宿主已吊销旧凭证覆盖；也可在桥进程环境设 `CODEX_API_KEY` 认证。本仓库不存放任何 key / token 值。
 - **状态：** 目前没有真实 Codex 订阅或 CLI 可供实测。codex 后端基于源码研究、JSONL fixture 与测试用的 fake CLI 实现（测试通过），最终需由真实用户在真实 Codex CLI 上验收。
 
 ## 前置条件

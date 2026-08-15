@@ -47,13 +47,13 @@ Per-user switch: `/backend agy`, `/backend grok`, or `/backend codex`. Each back
 ### Grok backend notes
 
 - Isolation: each WeChat user runs with `HOME` pointed at their own session directory. Conversation state stays there; login is machine-wide.
-- Auth: the session links to the host `~/.grok/auth.json` (copied as a fallback), reusing the host `grok login`. Alternatively, set `XAI_API_KEY` in the bridge process environment (the grok child is given that key after env sanitizing). A grok-remote TUI session being signed in is not the same as the host CLI login. No key or token values are stored in this repository.
+- Auth: the session links to the host `~/.grok/auth.json` (copied as a fallback), reusing the host `grok login`. The grok CLI rewrites `auth.json` via temp-file + rename, which replaces the session symlink with a regular file; the bridge promotes such session files back to the host (atomic copy) and re-links, so refreshed tokens never get overwritten by the revoked host copy. Alternatively, set `XAI_API_KEY` in the bridge process environment (the grok child is given that key after env sanitizing). A grok-remote TUI session being signed in is not the same as the host CLI login. No key or token values are stored in this repository.
 
 ### Codex backend notes
 
 - Runs `codex exec --json` for each single turn; conversation continuation uses `codex exec resume <thread_id> <prompt>` with the thread id persisted per user.
 - Isolation: each WeChat user runs with `HOME` and `CODEX_HOME` pointed at their own per-user session directory (`session_dir/.codex`), so sessions, logs, and caches never cross users.
-- Auth: the per-user session links to the host `~/.codex/auth.json` (copied as a fallback), reusing the host `codex login`. Alternatively, set `CODEX_API_KEY` in the bridge process environment to authenticate. No key or token values are stored in this repository.
+- Auth: the per-user session links to the host `~/.codex/auth.json` (copied as a fallback), reusing the host `codex login`. The codex CLI rewrites `auth.json` via temp-file + rename, which replaces the session symlink with a regular file; the bridge promotes such session files back to the host (atomic copy) and re-links, so refreshed tokens never get overwritten by the revoked host copy. Alternatively, set `CODEX_API_KEY` in the bridge process environment to authenticate. No key or token values are stored in this repository.
 - **Status:** there is currently no real Codex subscription or CLI available for live testing. The codex backend is implemented from source research, a JSONL fixture, and a fake CLI used by the test suite (which passes). Final acceptance depends on a real user running it against the actual Codex CLI.
 
 ## Prerequisites

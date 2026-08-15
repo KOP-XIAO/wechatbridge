@@ -14,6 +14,8 @@ import logging
 import os
 import re
 import shutil
+import stat
+import tempfile
 import time
 import uuid
 
@@ -101,15 +103,116 @@ def _host_codex_dir() -> str:
     return os.path.join(host_home, ".codex")
 
 
+def _session_auth_is_regular(path: str) -> bool:
+    """True if path exists as a regular file (lstat, no symlink follow)."""
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _atomic_copy_auth(src: str, dst: str) -> bool:
+    """Atomically copy src -> dst (same-dir temp file + os.replace).
+
+    The temp file lives in dirname(dst) to stay on the same filesystem.
+    Never logs auth file content — only paths and the failure reason.
+    """
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(dst), prefix=".auth.json.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "wb") as fout:
+            with open(src, "rb") as fin:
+                shutil.copyfileobj(fin, fout)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, dst)
+        tmp_path = None
+        return True
+    except OSError as e:
+        logger.error("Atomic copy auth -> %s failed: %s", dst, e)
+        return False
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _promote_session_auth(codex_dir: str) -> bool:
+    """Treat a regular session auth.json as refreshed credentials.
+
+    The CLI refreshes tokens via temp-file + rename; the rename replaces the
+    session symlink with a regular file, so the new credentials (incl. the
+    rotated refresh token) exist only in the session while host keeps the
+    already-revoked old ones. Promote the session file back to host
+    atomically, then re-link the session to the host file. The session
+    file is never unlinked when the copy fails or the non-empty
+    validation fails; after a successful copy the re-link step does
+    unlink the session file and rebuild the symlink (the new credentials
+    already live in host at that point, so no data is lost). Creates the
+    host dir (0o700) when missing.
+    """
+    dest = os.path.join(codex_dir, "auth.json")
+    if not _session_auth_is_regular(dest):
+        return True
+    host = os.path.join(_host_codex_dir(), "auth.json")
+    host_dir = os.path.dirname(host)
+    try:
+        if not os.path.isdir(host_dir):
+            os.makedirs(host_dir, mode=0o700, exist_ok=True)
+    except OSError as e:
+        logger.error("Cannot create host codex dir %s: %s", host_dir, e)
+        return False
+    try:
+        if os.path.getsize(dest) <= 0:
+            logger.error(
+                "Refusing to promote empty session auth %s (host %s untouched)",
+                dest,
+                host,
+            )
+            return False
+    except OSError as e:
+        logger.error("Cannot stat session auth %s: %s", dest, e)
+        return False
+    if not _atomic_copy_auth(dest, host):
+        logger.error(
+            "Promote session auth failed; keeping %s (host %s untouched)", dest, host
+        )
+        return False
+    try:
+        host_real = os.path.realpath(host)
+        os.unlink(dest)
+        os.symlink(host_real, dest)
+        logger.info("Promoted session auth.json -> %s", host_real)
+        return True
+    except OSError as e:
+        logger.error("Re-link %s after promote failed: %s", dest, e)
+        return False
+
+
 def _sync_codex_auth(codex_dir: str) -> bool:
     """Make session .codex/auth.json track the host login credentials.
 
-    Strategy: symlink session auth.json -> host auth.json (shared refresh).
-    Falls back to copy2 if symlink is not possible.
+    CLI refresh writes $CODEX_HOME/auth.json via temp-file + rename; the
+    rename replaces a session symlink with a regular file, so refreshed
+    credentials (incl. the rotated refresh token) land only in the session
+    while host keeps the old, already-revoked ones. A regular session
+    auth.json is therefore always treated as newer credentials: promote it
+    back to host atomically, then re-link the session to the host file. On
+    promote failure the session file is never unlinked. Falls back to copy2
+    if symlink is not possible.
     Returns True if credentials are available for the child process.
     """
     auth_src = os.path.join(_host_codex_dir(), "auth.json")
     auth_dst = os.path.join(codex_dir, "auth.json")
+
+    # 普通文件 = CLI rename 拆掉 symlink 后留下的更新凭证，先回流 host
+    if _session_auth_is_regular(auth_dst):
+        if not _promote_session_auth(codex_dir):
+            # promote 失败：session 文件是唯一的新凭证，绝不 unlink
+            return os.path.isfile(auth_dst)
 
     if not os.path.isfile(auth_src):
         logger.warning("Host codex auth missing: %s", auth_src)
@@ -706,6 +809,7 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
 
     t0 = time.time()
     session_dir = ensure_user_codex(user_id)
+    codex_dir = os.path.join(session_dir, ".codex")
 
     # Audit logging
     logger.info("[AUDIT] user=%s prompt=%.200s", user_id, prompt)
@@ -918,6 +1022,11 @@ async def run_codex(prompt: str, user_id: str, timeout: int = None) -> tuple:
             "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
         ), []
 
+    finally:
+        # 子进程结束后立刻 harvest：CLI 可能刚用 rename 拆掉 symlink 刷新了
+        # 凭证，普通文件一律回流 host（成功/非零退出/超时/取消均覆盖）
+        _promote_session_auth(codex_dir)
+
 
 # ---------------------------------------------------------------------------
 # Slash command support
@@ -931,6 +1040,7 @@ async def _run_codex_subcommand(subcmd_args: list, user_id: str) -> str:
     ``sanitize_env``.
     """
     session_dir = ensure_user_codex(user_id)
+    codex_dir = os.path.join(session_dir, ".codex")
     cmd = [config.codex_binary_path] + list(subcmd_args)
     process = None
     try:
@@ -985,6 +1095,9 @@ async def _run_codex_subcommand(subcmd_args: list, user_id: str) -> str:
             "执行出错",
             "这次没处理好，请稍后再试。若一直失败，请联系管理员。",
         )
+
+    finally:
+        _promote_session_auth(codex_dir)
 
 
 def _parse_codex_models(output: str) -> list[str]:
