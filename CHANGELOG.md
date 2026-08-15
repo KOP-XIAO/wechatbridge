@@ -5,6 +5,17 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+## [1.4.7] - 2026-08-15
+
+### Fixed
+
+- **Grok 未登录误报与 headless 认证**：`sanitize_env` 会剥掉 `XAI_API_KEY`，grok 子进程即使桥进程配了 key 也会报 `Not signed in`。grok 后端现在把 `XAI_API_KEY` 重新注入子进程；没有宿主 `~/.grok/auth.json` 且没有 key 时不再空跑 CLI。
+- **Grok 文档回传**：除 `write`/`edit`/`str_replace` 的 `file_path` 外，也认 `search_replace` 以及 `path`/`target_file`。Grok 用 `run_terminal_command` 生成的 pdf/docx 不会出现在写文件工具里，改为对本轮 `session_dir` 做有界扫描（跳过 `.grok`/`.gemini`/`.codex` 等内部树，避免把 bundled 税表 PDF 发回微信）。
+
+### Tests
+
+- grok `search_replace`+`path` 提取、session 扫描跳过 `.grok` bundled、`XAI_API_KEY` 回注。
+
 ## [1.4.6] - 2026-07-30
 
 ### Fixed

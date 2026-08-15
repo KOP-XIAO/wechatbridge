@@ -44,6 +44,11 @@ Default data paths expand from `~` (e.g. `~/.local/share/wechatbridge/<instance>
 
 Per-user switch: `/backend agy`, `/backend grok`, or `/backend codex`. Each backend keeps its own model / effort / mode memory and persona file layout. Global default is `WECHATBRIDGE_BACKEND`.
 
+### Grok backend notes
+
+- Isolation: each WeChat user runs with `HOME` pointed at their own session directory. Conversation state stays there; login is machine-wide.
+- Auth: the session links to the host `~/.grok/auth.json` (copied as a fallback), reusing the host `grok login`. Alternatively, set `XAI_API_KEY` in the bridge process environment (the grok child is given that key after env sanitizing). A grok-remote TUI session being signed in is not the same as the host CLI login. No key or token values are stored in this repository.
+
 ### Codex backend notes
 
 - Runs `codex exec --json` for each single turn; conversation continuation uses `codex exec resume <thread_id> <prompt>` with the thread id persisted per user.

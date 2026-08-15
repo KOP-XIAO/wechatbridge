@@ -44,6 +44,11 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 
 微信里 `/backend agy`、`/backend grok` 或 `/backend codex` 按用户切换。各后端各自记模型 / 强度 / 模式，人格文件布局也分开。全局默认见 `WECHATBRIDGE_BACKEND`。
 
+### grok 后端说明
+
+- 隔离：每个微信用户运行时把 `HOME` 指到自己的会话目录，对话状态在会话里；登录态跟机器走。
+- 认证：每用户会话链接宿主 `~/.grok/auth.json`（fallback 为拷贝），复用宿主 `grok login`；也可在桥进程环境设 `XAI_API_KEY`（sanitize 之后会再注入 grok 子进程）。grok-remote 客户端已登录，不等于主机 CLI 已登录。本仓库不存放任何 key / token 值。
+
 ### codex 后端说明
 
 - 每轮以 `codex exec --json` 运行；续聊使用 `codex exec resume <thread_id> <prompt>`，thread id 按用户持久化。

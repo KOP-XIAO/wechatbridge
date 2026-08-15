@@ -19,12 +19,44 @@ from .runner_common import (
     clean_output, load_prefs, save_prefs, is_dangerous, parse_model_effort,
     sanitize_env, terminate_process, update_active_prefs,
     format_error, format_cli_error, is_bridge_formatted_reply, EMPTY_REPLY, validate_add_dir,
+    path_is_under,
 )
 
 logger = logging.getLogger("grok_runner")
 
 # execve 单参数上限（Linux MAX_ARG_STRLEN = 128KB），留安全余量
 _MAX_ARG_BYTES = 120 * 1024
+
+# grok CLI 写文件工具名（新旧混用）。只用这些调用的 path 抽产物会漏掉
+# 经 run_terminal_command 生成的 pdf/docx，所以后面还有目录扫描兜底。
+_GROK_WRITE_TOOLS = frozenset({
+    "write",
+    "edit",
+    "str_replace",
+    "search_replace",
+    "Write",
+    "Edit",
+    "StrReplace",
+    "SearchReplace",
+})
+_GROK_PATH_KEYS = ("file_path", "path", "target_file")
+_GROK_PASSTHROUGH_ENV = ("XAI_API_KEY",)
+_GROK_SKIP_DIR_NAMES = frozenset({
+    ".grok",
+    ".gemini",
+    ".codex",
+    ".git",
+    "__pycache__",
+    "node_modules",
+    "venv",
+    ".venv",
+    "cache",
+    ".cache",
+})
+_GROK_SKIP_FILE_NAMES = frozenset({
+    "prefs.json",
+    "grok_persona.txt",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +138,28 @@ def ensure_user_grok(user_id: str) -> str:
     _sync_grok_auth(grok_dir)
 
     return session_dir
+
+
+def _grok_has_credentials() -> bool:
+    """True if the grok child can authenticate: host auth.json or XAI_API_KEY."""
+    if os.path.isfile(os.path.join(_host_grok_dir(), "auth.json")):
+        return True
+    key = os.environ.get("XAI_API_KEY")
+    return bool(key and str(key).strip())
+
+
+def _apply_grok_runtime_env(env: dict) -> dict:
+    """Re-inject grok auth env after sanitize_env (which strips *API_KEY).
+
+    Host `grok login` uses ~/.grok/auth.json (symlinked into the session).
+    Headless alternative is XAI_API_KEY on the bridge process; without this
+    passthrough the child always sees "Not signed in".
+    """
+    for key in _GROK_PASSTHROUGH_ENV:
+        val = os.environ.get(key)
+        if val:
+            env[key] = val
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -280,11 +334,43 @@ def _has_grok_session(session_dir: str) -> bool:
 # Artifact extraction from chat_history.jsonl
 # ---------------------------------------------------------------------------
 
+def _grok_tool_path(args) -> str:
+    """Path from a grok write/edit tool argument object."""
+    if not isinstance(args, dict):
+        return ""
+    for key in _GROK_PATH_KEYS:
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def _resolve_grok_artifact_path(fp: str, session_dir: str, since: float, seen: set, artifacts: list) -> None:
+    """Resolve one candidate path and append if it is a new file from this turn."""
+    if not fp:
+        return
+    if not os.path.isabs(fp):
+        fp = os.path.join(session_dir, fp)
+    try:
+        fp = os.path.abspath(fp)
+    except (OSError, ValueError):
+        return
+    try:
+        if since and os.path.getmtime(fp) < since - 2.0:
+            return
+    except OSError:
+        return
+    key = (os.path.basename(fp), fp)
+    if key not in seen:
+        seen.add(key)
+        artifacts.append(key)
+
+
 def _extract_grok_artifacts(session_dir: str, session_id: str, since: float = 0.0) -> list:
     """Extract (name, abs_path) tuples from grok session chat_history.jsonl.
 
     grok stores sessions under $HOME/.grok/sessions/<url-encoded-cwd>/<session-id>/.
-    The chat_history.jsonl contains structured tool_calls with file_path arguments
+    The chat_history.jsonl contains structured tool_calls with path arguments
     from write/edit operations.
 
     ``since``: 只收录 mtime >= since 的文件——chat_history.jsonl 跨轮累积，
@@ -315,6 +401,8 @@ def _extract_grok_artifacts(session_dir: str, session_id: str, since: float = 0.
                     continue
                 if d.get("type") == "assistant" and d.get("tool_calls"):
                     for tc in d.get("tool_calls", []):
+                        if not isinstance(tc, dict):
+                            continue
                         name = tc.get("name", "")
                         args = tc.get("arguments", "")
                         if isinstance(args, str):
@@ -322,34 +410,89 @@ def _extract_grok_artifacts(session_dir: str, session_id: str, since: float = 0.
                                 args = json.loads(args)
                             except json.JSONDecodeError:
                                 continue
-                        if name in ("write", "edit", "str_replace") and isinstance(args, dict):
-                            fp = args.get("file_path", "")
-                            if not fp:
-                                continue
-                            # Relative paths resolve against session_dir (cwd)
-                            if not os.path.isabs(fp):
-                                fp = os.path.join(session_dir, fp)
-                            try:
-                                fp = os.path.abspath(fp)
-                            except (OSError, ValueError):
-                                continue
-                            # 只收录本轮运行期间新写/修改的文件
-                            try:
-                                if since and os.path.getmtime(fp) < since - 2.0:
-                                    continue
-                            except OSError:
-                                continue  # 文件已不存在，无需回传
-                            art_name = os.path.basename(fp)
-                            key = (art_name, fp)
-                            if key not in seen:
-                                seen.add(key)
-                                artifacts.append(key)
+                        if name not in _GROK_WRITE_TOOLS:
+                            continue
+                        _resolve_grok_artifact_path(
+                            _grok_tool_path(args), session_dir, since, seen, artifacts
+                        )
     except OSError as e:
         logger.warning("Failed to read chat_history.jsonl: %s", e)
 
     if artifacts:
         logger.debug("Extracted %d grok artifacts: %s", len(artifacts), [n for n, _ in artifacts[:3]])
     return artifacts
+
+
+def _scan_grok_session_artifacts(session_dir: str, since: float = 0.0) -> list:
+    """Collect regular files written under session_dir during this turn.
+
+    grok often creates pdf/docx via run_terminal_command, which never appears
+    in write/edit tool_calls. Skip .grok / .gemini / .codex and other internal
+    trees so bundled skill PDFs are not sent back.
+
+    Bounded like the codex fallback: empty result if the walk exceeds
+    200 files, 50 directories, or 2 seconds.
+    """
+    if not since or not session_dir or not os.path.isdir(session_dir):
+        return []
+
+    artifacts = []
+    seen = set()
+    cutoff = since - 2.0
+    t_start = time.monotonic()
+    file_count = 0
+    dir_count = 0
+    max_files = 200
+    max_dirs = 50
+    max_scan_time = 2.0
+
+    for dirpath, dirnames, filenames in os.walk(session_dir, followlinks=False):
+        dir_count += 1
+        if dir_count > max_dirs or time.monotonic() - t_start > max_scan_time:
+            return []
+        dirnames[:] = [d for d in dirnames if d not in _GROK_SKIP_DIR_NAMES]
+        for fn in filenames:
+            file_count += 1
+            if file_count > max_files:
+                return []
+            if fn in _GROK_SKIP_FILE_NAMES or fn.startswith(".initialized."):
+                continue
+            fp = os.path.join(dirpath, fn)
+            try:
+                if os.path.islink(fp) or not os.path.isfile(fp):
+                    continue
+                if os.path.getmtime(fp) < cutoff:
+                    continue
+                if not path_is_under(fp, session_dir):
+                    continue
+                real = os.path.realpath(fp)
+            except OSError:
+                continue
+            key = (os.path.basename(real), real)
+            if key not in seen:
+                seen.add(key)
+                artifacts.append(key)
+    return artifacts
+
+
+def _merge_grok_artifacts(*groups) -> list:
+    """Dedupe (name, path) tuples by realpath, preserve first-seen order."""
+    merged = []
+    seen = set()
+    for group in groups:
+        for item in group or []:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                continue
+            name, path = item
+            try:
+                key = os.path.realpath(path)
+            except OSError:
+                key = path
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append((name, path))
+    return merged
 
 
 def _parse_grok_output(stdout_text: str, session_dir: str, since: float = 0.0) -> tuple:
@@ -378,6 +521,10 @@ def _parse_grok_output(stdout_text: str, session_dir: str, since: float = 0.0) -
     artifacts = []
     if session_id:
         artifacts = _extract_grok_artifacts(session_dir, session_id, since=since)
+    # Merge directory scan so pdf/docx created via shell still go back.
+    artifacts = _merge_grok_artifacts(
+        artifacts, _scan_grok_session_artifacts(session_dir, since)
+    )
 
     # Strip file:/// links from display (in case grok emits them)
     display = re.sub(
@@ -413,6 +560,16 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
     t0 = time.time()
     session_dir = ensure_user_grok(user_id)
 
+    if not _grok_has_credentials():
+        logger.warning(
+            "grok credentials missing: no host auth.json and no XAI_API_KEY"
+        )
+        return format_cli_error(
+            "Not signed in. To authenticate without a browser, run:\n"
+            "  grok login --device-code",
+            backend="grok",
+        ), []
+
     # Audit logging
     logger.info("[AUDIT] user=%s prompt=%.200s", user_id, prompt)
     if is_dangerous(prompt):
@@ -441,7 +598,7 @@ async def run_grok(prompt: str, user_id: str, timeout: int = None) -> tuple:
 
     process = None
     try:
-        env = sanitize_env(session_dir)
+        env = _apply_grok_runtime_env(sanitize_env(session_dir))
         env["PAGER"] = "cat"
         env["CI"] = "true"
         env["NONINTERACTIVE"] = "1"
@@ -581,7 +738,7 @@ async def _run_grok_subcommand(subcmd_args: list, user_id: str) -> str:
     cmd = [config.grok_binary_path] + subcmd_args
     process = None
     try:
-        env = sanitize_env(session_dir)
+        env = _apply_grok_runtime_env(sanitize_env(session_dir))
         process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,

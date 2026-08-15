@@ -649,6 +649,96 @@ class TestGrokRelativePathArtifacts(unittest.TestCase):
             self.assertEqual(path, os.path.abspath(abs_file))
             self.assertTrue(os.path.isabs(path))
 
+    def test_search_replace_path_key(self):
+        from wechatbridge.grok import _extract_grok_artifacts
+        import urllib.parse
+
+        with tempfile.TemporaryDirectory() as session_dir:
+            abs_file = os.path.join(session_dir, "report.docx")
+            with open(abs_file, "w", encoding="utf-8") as f:
+                f.write("doc")
+            session_id = "sess-sr-1"
+            hist_dir = os.path.join(
+                session_dir,
+                ".grok",
+                "sessions",
+                urllib.parse.quote(session_dir, safe=""),
+                session_id,
+            )
+            os.makedirs(hist_dir)
+            line = {
+                "type": "assistant",
+                "tool_calls": [
+                    {
+                        "name": "search_replace",
+                        "arguments": {"path": "report.docx"},
+                    }
+                ],
+            }
+            with open(os.path.join(hist_dir, "chat_history.jsonl"), "w", encoding="utf-8") as f:
+                f.write(json.dumps(line) + "\n")
+            arts = _extract_grok_artifacts(session_dir, session_id, since=0.0)
+            self.assertEqual(arts, [("report.docx", os.path.abspath(abs_file))])
+
+
+class TestGrokSessionScanArtifacts(unittest.TestCase):
+    def test_scan_picks_new_pdf_skips_bundled(self):
+        from wechatbridge.grok import _scan_grok_session_artifacts, _merge_grok_artifacts
+
+        with tempfile.TemporaryDirectory() as session_dir:
+            pdf = os.path.join(session_dir, "out.pdf")
+            with open(pdf, "wb") as f:
+                f.write(b"%PDF-1.4")
+            bundled_dir = os.path.join(session_dir, ".grok", "bundled", "skills", "pdf")
+            os.makedirs(bundled_dir)
+            bundled = os.path.join(bundled_dir, "form.pdf")
+            with open(bundled, "wb") as f:
+                f.write(b"%PDF-1.4")
+            old = os.path.join(session_dir, "old.docx")
+            with open(old, "wb") as f:
+                f.write(b"PK")
+            os.utime(old, (1_000_000, 1_000_000))
+            arts = _scan_grok_session_artifacts(session_dir, since=time.time())
+            paths = {p for _, p in arts}
+            self.assertIn(os.path.realpath(pdf), paths)
+            self.assertNotIn(os.path.realpath(bundled), paths)
+            self.assertNotIn(os.path.realpath(old), paths)
+
+    def test_merge_dedupes_by_realpath(self):
+        from wechatbridge.grok import _merge_grok_artifacts
+
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "a.pdf")
+            with open(p, "wb") as f:
+                f.write(b"x")
+            merged = _merge_grok_artifacts(
+                [("a.pdf", p)],
+                [("a.pdf", os.path.realpath(p))],
+            )
+            self.assertEqual(merged, [("a.pdf", p)])
+
+
+class TestGrokAuthPassthrough(unittest.TestCase):
+    def test_apply_reinjects_xai_key(self):
+        from wechatbridge.grok import _apply_grok_runtime_env, _grok_has_credentials
+        from wechatbridge.runner_common import sanitize_env
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"XAI_API_KEY": "secret-xai"}, clear=False):
+                env = sanitize_env(td)
+                self.assertNotIn("XAI_API_KEY", env)
+                env = _apply_grok_runtime_env(env)
+                self.assertEqual(env["XAI_API_KEY"], "secret-xai")
+                self.assertTrue(_grok_has_credentials())
+
+    def test_has_credentials_false_without_auth_or_key(self):
+        from wechatbridge.grok import _grok_has_credentials
+
+        with mock.patch("wechatbridge.grok._host_grok_dir", return_value="/no/such/grok-home"):
+            with mock.patch.dict(os.environ, {"XAI_API_KEY": ""}, clear=False):
+                os.environ.pop("XAI_API_KEY", None)
+                self.assertFalse(_grok_has_credentials())
+
 
 class TestILinkDeliveryAccepted(unittest.TestCase):
     def test_predicate(self):
