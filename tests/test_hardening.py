@@ -910,6 +910,183 @@ class TestClearInitializedIfNoHistory(unittest.TestCase):
             self.assertTrue(cleared.get("grok"))
             self.assertNotIn("codex", cleared)
 
+    def test_dsh_branch_clears_flag_when_no_history(self):
+        from wechatbridge.runner_common import _clear_initialized_if_no_history
+
+        with tempfile.TemporaryDirectory() as user_dir:
+            dsh_flag = os.path.join(user_dir, ".initialized.dsh")
+            with open(dsh_flag, "w", encoding="utf-8") as f:
+                f.write("")
+
+            cleared = _clear_initialized_if_no_history(user_dir)
+
+            self.assertFalse(os.path.exists(dsh_flag))
+            self.assertTrue(cleared.get("dsh"))
+            self.assertNotIn("grok", cleared)
+            self.assertNotIn("codex", cleared)
+            self.assertNotIn("agy", cleared)
+
+
+class TestHostDshSessionCleanup(unittest.TestCase):
+    """Machine-wide $DSH_HOME/sessions/ cleanup during session data pruning."""
+
+    def test_expired_dsh_sessions_removed_and_fresh_kept(self):
+        from wechatbridge.runner_common import clean_session_data
+        from wechatbridge.config import config
+
+        with tempfile.TemporaryDirectory() as td:
+            host_dsh = os.path.join(td, "dsh-home")
+            sessions_root = os.path.join(host_dsh, "sessions")
+
+            # 1. Expired session under cwd1 (mtime = 40 days ago)
+            old_session = os.path.join(sessions_root, "cwd1", "session-old")
+            os.makedirs(old_session, exist_ok=True)
+            old_file = os.path.join(old_session, "chat.jsonl")
+            with open(old_file, "w", encoding="utf-8") as f:
+                f.write('{"role": "user"}\n')
+            old_mtime = time.time() - 40 * 86400
+            os.utime(old_file, (old_mtime, old_mtime))
+            os.utime(old_session, (old_mtime, old_mtime))
+
+            # 2. Fresh session under cwd1 (mtime = now)
+            fresh_session = os.path.join(sessions_root, "cwd1", "session-fresh")
+            os.makedirs(fresh_session, exist_ok=True)
+            fresh_file = os.path.join(fresh_session, "chat.jsonl")
+            with open(fresh_file, "w", encoding="utf-8") as f:
+                f.write('{"role": "user"}\n')
+
+            # 3. Expired session under cwd2 (will become empty and cwd2 rmdir'd)
+            old_session2 = os.path.join(sessions_root, "cwd2", "session-old2")
+            os.makedirs(old_session2, exist_ok=True)
+            old_file2 = os.path.join(old_session2, "chat.jsonl")
+            with open(old_file2, "w", encoding="utf-8") as f:
+                f.write('{"role": "user"}\n')
+            os.utime(old_file2, (old_mtime, old_mtime))
+            os.utime(old_session2, (old_mtime, old_mtime))
+
+            session_base = os.path.join(td, "user_sessions")
+            os.makedirs(session_base, exist_ok=True)
+
+            with mock.patch.object(config, "dsh_home", host_dsh), \
+                 mock.patch.object(config, "session_base_dir", session_base), \
+                 mock.patch.object(config, "history_retention_days", 30):
+                removed = clean_session_data()
+
+            self.assertGreaterEqual(removed, 2)
+            # Expired sessions removed
+            self.assertFalse(os.path.exists(old_session), "old session-old should be removed")
+            self.assertFalse(os.path.exists(old_session2), "old session-old2 should be removed")
+            # Fresh session preserved
+            self.assertTrue(os.path.exists(fresh_session), "fresh session should be preserved")
+            self.assertTrue(os.path.exists(fresh_file), "fresh file should be preserved")
+            # Empty bucket cwd2 should be pruned
+            self.assertFalse(os.path.exists(os.path.join(sessions_root, "cwd2")), "empty cwd2 bucket should be pruned")
+            # cwd1 still exists because it has fresh_session
+            self.assertTrue(os.path.exists(os.path.join(sessions_root, "cwd1")), "cwd1 bucket should still exist")
+
+    def test_implicit_dsh_home_skips_cleanup(self):
+        from wechatbridge.runner_common import clean_session_data
+        from wechatbridge.config import config
+
+        with tempfile.TemporaryDirectory() as td:
+            host_dsh = os.path.join(td, ".dsh")
+            sessions_root = os.path.join(host_dsh, "sessions")
+
+            # Expired session under host ~/.dsh/sessions
+            old_session = os.path.join(sessions_root, "cwd1", "session-old")
+            os.makedirs(old_session, exist_ok=True)
+            old_file = os.path.join(old_session, "chat.jsonl")
+            with open(old_file, "w", encoding="utf-8") as f:
+                f.write('{"role": "user"}\n')
+            old_mtime = time.time() - 40 * 86400
+            os.utime(old_file, (old_mtime, old_mtime))
+            os.utime(old_session, (old_mtime, old_mtime))
+
+            session_base = os.path.join(td, "user_sessions")
+            os.makedirs(session_base, exist_ok=True)
+
+            with mock.patch.object(config, "dsh_home", ""), \
+                 mock.patch.dict(os.environ, {"WECHATBRIDGE_HOST_HOME": td}, clear=False), \
+                 mock.patch.object(config, "session_base_dir", session_base), \
+                 mock.patch.object(config, "history_retention_days", 30):
+                removed = clean_session_data()
+
+            self.assertEqual(removed, 0)
+            self.assertTrue(
+                os.path.exists(old_session),
+                "implicit host ~/.dsh session must NOT be removed",
+            )
+
+    def test_whitespace_dsh_home_not_explicit_and_skips_cleanup(self):
+        from wechatbridge.runner_common import clean_session_data
+        from wechatbridge.config import config, host_dsh_home, is_dsh_home_explicit
+
+        with tempfile.TemporaryDirectory() as td:
+            host_dsh = os.path.join(td, ".dsh")
+            sessions_root = os.path.join(host_dsh, "sessions")
+
+            old_session = os.path.join(sessions_root, "cwd1", "session-old")
+            os.makedirs(old_session, exist_ok=True)
+            old_file = os.path.join(old_session, "chat.jsonl")
+            with open(old_file, "w", encoding="utf-8") as f:
+                f.write('{"role": "user"}\n')
+            old_mtime = time.time() - 40 * 86400
+            os.utime(old_file, (old_mtime, old_mtime))
+            os.utime(old_session, (old_mtime, old_mtime))
+
+            session_base = os.path.join(td, "user_sessions")
+            os.makedirs(session_base, exist_ok=True)
+
+            with mock.patch.object(config, "dsh_home", "   "), \
+                 mock.patch.dict(os.environ, {"WECHATBRIDGE_HOST_HOME": td}, clear=False), \
+                 mock.patch.object(config, "session_base_dir", session_base), \
+                 mock.patch.object(config, "history_retention_days", 30):
+                self.assertFalse(is_dsh_home_explicit())
+                self.assertEqual(host_dsh_home(), host_dsh)
+                removed = clean_session_data()
+
+            self.assertEqual(removed, 0)
+            self.assertTrue(os.path.exists(old_session), "whitespace dsh_home must NOT remove host sessions")
+
+    def test_relative_dsh_home_normalized_to_abspath_and_cleaned(self):
+        from wechatbridge.runner_common import clean_session_data
+        from wechatbridge.config import config, host_dsh_home, is_dsh_home_explicit
+
+        with tempfile.TemporaryDirectory() as td:
+            rel_dir = os.path.join(".", "relative_dsh_home_test")
+            abs_dir = os.path.abspath(rel_dir)
+            sessions_root = os.path.join(abs_dir, "sessions")
+            self.addCleanup(lambda: shutil.rmtree(abs_dir, ignore_errors=True))
+
+            old_session = os.path.join(sessions_root, "cwd1", "session-old")
+            os.makedirs(old_session, exist_ok=True)
+            old_file = os.path.join(old_session, "chat.jsonl")
+            with open(old_file, "w", encoding="utf-8") as f:
+                f.write('{"role": "user"}\n')
+            old_mtime = time.time() - 40 * 86400
+            os.utime(old_file, (old_mtime, old_mtime))
+            os.utime(old_session, (old_mtime, old_mtime))
+
+            session_base = os.path.join(td, "user_sessions")
+            os.makedirs(session_base, exist_ok=True)
+
+            with mock.patch.object(config, "dsh_home", rel_dir), \
+                 mock.patch.object(config, "session_base_dir", session_base), \
+                 mock.patch.object(config, "history_retention_days", 30):
+                self.assertTrue(is_dsh_home_explicit())
+                self.assertEqual(host_dsh_home(), abs_dir)
+                removed = clean_session_data()
+
+            self.assertGreaterEqual(removed, 1)
+            self.assertFalse(os.path.exists(old_session), "relative dsh_home session must be cleaned via abspath")
+
+    def test_absolute_dsh_home_behavior_unchanged(self):
+        from wechatbridge.config import config, host_dsh_home, is_dsh_home_explicit
+        with mock.patch.object(config, "dsh_home", "/abs/path/to/dsh"):
+            self.assertTrue(is_dsh_home_explicit())
+            self.assertEqual(host_dsh_home(), "/abs/path/to/dsh")
+
+
 
 class TestCleanCodexSessionsOSError(unittest.TestCase):
     """Regression: a single unreadable directory must not abort the whole codex

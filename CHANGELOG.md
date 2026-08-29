@@ -5,6 +5,14 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
+### Added
+
+- **dsh 后端**：新增 DeepSeek Harness CLI（`dsh`）作为第四个 CLI 后端（`/backend dsh`）。以 `dsh --profile headless -- <prompt>` 单轮运行，cwd 为每用户会话目录；从输出提取 `file:///` 与 markdown 文件链接作为可回传产物（路径字符白名单避免误吞紧邻中文）；`DSH_HOME` 显式配置时启用专用主目录及自动会话保留清理，未配置时复用宿主 `~/.dsh` 且跳过自动清理；对会话目录外的 `@绝对路径` mention 予以屏蔽拦截（替换为 `[blocked-path]`）；`/help`、`/clear`、`/new` 支持，模型/强度/人格类指令暂返回"暂不支持"。headless 每次新建会话，故为单轮模式。
+
+### Tests
+
+- 新增 `tests/test_dsh.py` + `tests/fake_dsh.py`：命令构造、产物提取、成功/失败/超时路径、未登录预检、slash 指令、`/backend dsh` 切换。
+
 ## [1.4.9] - 2026-08-16
 
 ### Fixed
