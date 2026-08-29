@@ -5,21 +5,21 @@
 ![license](https://img.shields.io/badge/license-MIT-blue.svg)
 ![python](https://img.shields.io/badge/python-3.10+-blue.svg)
 
-WeChatBridge connects a WeChat bot to agentic coding CLIs (Google's agy / Antigravity, xAI's Grok Build, or OpenAI's Codex). From WeChat you can send text, images, files, and voice-as-text to the active CLI, get replies back, and receive certain generated files over the WeChat CDN. Switch backends per user with `/backend` — no restart.
+WeChatBridge connects a WeChat bot to agentic coding CLIs (Google's agy / Antigravity, xAI's Grok Build, OpenAI's Codex, or DeepSeek Harness' dsh). From WeChat you can send text, images, files, and voice-as-text to the active CLI, get replies back, and receive certain generated files over the WeChat CDN. Switch backends per user with `/backend` — no restart.
 
 ```
-WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok / codex CLI
+WeChat (phone)  ⇄  iLink bot API  ⇄  WeChatBridge  ⇄  agy / grok / codex / dsh CLI
                                      (this project)    (runs tools)
 ```
 
-The bridge process stays up and long-polls iLink. For prompts that go to a CLI, it spawns one `agy` or `grok` child (`-p` single-turn) and exits that child when done — the child does not stay resident. Many slash commands (`/help`, `/backend`, `/persona`, …) are handled inside the bridge and never start a CLI. Only artifacts the bridge can detect under the user's allowed session paths are pushed back via CDN.
+The bridge process stays up and long-polls iLink. For prompts that go to a CLI, it spawns one `agy` / `grok` / `codex` / `dsh` child (single-turn) and exits that child when done — the child does not stay resident. Many slash commands (`/help`, `/backend`, `/persona`, …) are handled inside the bridge and never start a CLI. Only artifacts the bridge can detect under the user's allowed session paths are pushed back via CDN.
 
 ## Features
 
-- Text, image, file, and voice (WeChat server-side transcription only) go to the **active** backend (`agy`, `grok`, or `codex`)
+- Text, image, file, and voice (WeChat server-side transcription only) go to the **active** backend (`agy`, `grok`, `codex`, or `dsh`)
 - Detected CLI artifacts under the per-user allowed tree can be sent back (size-capped); not every file the CLI touches
 - Each WeChat user gets an isolated workspace; model / effort / mode are remembered **per backend**
-- Runtime backend switch: `/backend agy`, `/backend grok`, or `/backend codex` (clears that backend's continuation state — the agy/grok continuation flag and the codex `thread_id`/resume state — so the next CLI turn starts a fresh session; history files on disk are not wiped immediately)
+- Runtime backend switch: `/backend agy`, `/backend grok`, `/backend codex`, or `/backend dsh` (clears that backend's continuation state — the agy/grok continuation flag and the codex `thread_id`/resume state — so the next CLI turn starts a fresh session; history files on disk are not wiped immediately)
 - Slash commands for model, session reset, persona, and more (see below)
 - Dangerous-prompt gate: a **keyword list** of concrete destructive patterns asks for confirmation before run
 - Sender whitelist (`WECHATBRIDGE_ALLOWED_SENDERS`; empty = allow all)
@@ -41,8 +41,16 @@ Default data paths expand from `~` (e.g. `~/.local/share/wechatbridge/<instance>
 - **agy** (default) — Google Antigravity CLI
 - **grok** — xAI Grok Build CLI
 - **codex** — OpenAI Codex CLI
+- **dsh** — DeepSeek Harness CLI (one-shot `headless` profile)
 
-Per-user switch: `/backend agy`, `/backend grok`, or `/backend codex`. Each backend keeps its own model / effort / mode memory and persona file layout. Global default is `WECHATBRIDGE_BACKEND`.
+Per-user switch: `/backend agy`, `/backend grok`, `/backend codex`, or `/backend dsh`. Each backend keeps its own model / effort / mode memory and persona file layout. Global default is `WECHATBRIDGE_BACKEND`.
+
+### dsh backend notes
+
+- **Single-turn:** the `headless` profile always creates a fresh session per invocation (`session-<uuid>`), so every WeChat message starts a new dsh session. `/clear` / `/new` are accepted but are no-ops, and `/model`, `/fast`, `/planning`, `/persona`, `/add-dir` are not wired yet (they return a short "not supported" notice).
+- Runs `dsh --profile headless <prompt>` with `cwd` = the per-user session directory (per-user workspace; model-created files land there and can be sent back via CDN).
+- Auth / profiles are **machine-wide** (`~/.dsh`, same model as grok's machine-wide login): the child's `HOME` points at the per-user session dir, so the bridge always passes `DSH_HOME` explicitly. Override with `WECHATBRIDGE_DSH_HOME` (e.g. a dedicated service home; for per-user `DSH_HOME` isolation, pre-seed profiles there). `DSH_BIN_PATH`, `DSH_PROFILE`, and `DSH_TIMEOUT` are configurable.
+- Status: implemented from the published `dsh` CLI contract (headless bundle source) plus a fake CLI in the test suite; final acceptance depends on a real `dsh login` + headless run.
 
 ### Grok backend notes
 
@@ -62,7 +70,8 @@ Per-user switch: `/backend agy`, `/backend grok`, or `/backend codex`. Each back
   - **agy** on `PATH`, or set `AGY_BIN_PATH`
   - **and/or grok** on `PATH`, or set `GROK_BIN_PATH`
   - **and/or codex** on `PATH`, or set `CODEX_BIN_PATH`
-  - Antigravity is Google's terminal agentic coding CLI (successor to Gemini CLI). Grok Build is xAI's counterpart; Codex is OpenAI's terminal agentic coding CLI.
+  - **and/or dsh** on `PATH`, or set `DSH_BIN_PATH` (DeepSeek Harness, `dsh login` required)
+  - Antigravity is Google's terminal agentic coding CLI (successor to Gemini CLI). Grok Build is xAI's counterpart; Codex is OpenAI's terminal agentic coding CLI; dsh is DeepSeek Harness' CLI.
 - A WeChat account with a [ClawBot / iLink](https://ilinkai.weixin.qq.com) bot (QR bind on first run)
 - Python 3.10+
 
@@ -133,10 +142,14 @@ Key variables (all have defaults):
 | `AGY_BIN_PATH` | `agy` | path to the agy binary |
 | `GROK_BIN_PATH` | `grok` | path to the grok binary |
 | `CODEX_BIN_PATH` | `codex` | path to the codex binary |
-| `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok` / `codex`; overridable per user via `/backend`) |
+| `DSH_BIN_PATH` | `dsh` | path to the dsh binary |
+| `DSH_PROFILE` | `headless` | dsh profile booted for one-shot tasks |
+| `DSH_TIMEOUT` | `600` | dsh CLI run timeout in seconds |
+| `WECHATBRIDGE_DSH_HOME` | _empty_ | explicit `DSH_HOME` passed to the dsh child (empty = machine-wide `~/.dsh`) |
+| `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok` / `codex` / `dsh`; overridable per user via `/backend`) |
 | `WECHATBRIDGE_INSTANCE` | `default` | instance name; state / session / QR paths derive from it |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _empty_ | comma-separated WeChat IDs (empty = allow all) |
-| `AGY_TIMEOUT` | `600` | CLI run timeout in seconds (all three backends) |
+| `AGY_TIMEOUT` | `600` | CLI run timeout in seconds (agy / grok / codex backends) |
 | `WECHATBRIDGE_MAX_OUTBOUND_BYTES` | `104857600` | max file size sent back to WeChat (100 MB) |
 | `WECHATBRIDGE_MAX_INBOUND_BYTES` | `20971520` | max inbound image/file after download (20 MB) |
 | `WECHATBRIDGE_MAX_CONCURRENT` | `4` | global concurrent process slots; same user serial (queue does not hold a slot); extras get a busy reply |
@@ -222,7 +235,7 @@ See [`deploy/wechatbridge-windows.md`](deploy/wechatbridge-windows.md).
 | Command | Action |
 |---|---|
 | `/help` | list supported commands for the active backend |
-| `/backend <agy\|grok\|codex>` | switch CLI backend for this WeChat user (on real change: clears that backend's continuation state — agy/grok flag and codex `thread_id`/resume — so the next turn starts a fresh session; history files may remain until retention cleanup) |
+| `/backend <agy\|grok\|codex\|dsh>` | switch CLI backend for this WeChat user (on real change: clears that backend's continuation state — agy/grok flag and codex `thread_id`/resume — so the next turn starts a fresh session; history files may remain until retention cleanup) |
 | `/clear` or `/new` | drop continue flag so the next CLI turn is a new conversation (does not instantly delete history files) |
 | `/model <name>` | set model (all backends validate against a live list: agy/grok via CLI `models`; codex via `codex debug models` [then `--bundled`]; unknown name or list-fetch failure refuse and do not write prefs; see `/models`) |
 | `/models` | list models — agy/grok/codex all query the live CLI (codex: `debug models`; falls back to a built-in reference note only if the live list cannot be fetched) |
@@ -254,8 +267,10 @@ Other `/…` commands are either rejected (e.g. `/exit`), reported as unsupporte
 
 ## Limitations
 
-- Not a standalone agent — requires agy and/or grok and/or codex.
+- Not a standalone agent — requires agy and/or grok and/or codex and/or dsh.
 - The **codex** backend is not yet verified against a real Codex subscription/CLI; it is validated by source research, a JSONL fixture, and a fake CLI in tests. Treat it as community-tested until a real user confirms.
+- The **dsh** backend is single-turn only (the `headless` profile always starts a fresh session) and has not yet been verified against a real `dsh login` + headless run; it is validated against the published headless bundle contract and a fake CLI in tests.
+- dsh model/effort/mode/persona slash commands are not wired yet; `/model`, `/fast`, `/planning`, `/persona`, `/add-dir` return a "not supported" notice on the dsh backend.
 - Voice is WeChat speech-to-text only; no local ASR; empty transcript → “type instead”.
 - No video send/receive; no native WeChat voice-bubble replies (no silk encode).
 - One WeChat binding per process; multiple accounts need multiple instances (`WECHATBRIDGE_INSTANCE`).

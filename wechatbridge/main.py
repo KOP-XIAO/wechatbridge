@@ -20,6 +20,7 @@ from . import __version__
 from .config import config, ensure_runtime_dirs
 from .ilink import ILinkClient
 from .runner_common import (
+    KNOWN_BACKENDS,
     clean_session_media,
     clear_initialized,
     classify_upstream_failure,
@@ -139,6 +140,9 @@ async def _run_llm(prompt: str, user_id: str) -> tuple[str, list]:
     elif backend == "codex":
         from .codex import run_codex
         return await run_codex(prompt, user_id)
+    elif backend == "dsh":
+        from .dsh import run_dsh
+        return await run_dsh(prompt, user_id)
     else:
         from .agy import run_agy
         return await run_agy(prompt, user_id)
@@ -433,6 +437,9 @@ async def _handle_slash(client: ILinkClient, text: str, user_id: str, context_to
     elif backend == "codex":
         from .codex import handle_codex_slash_command
         return await handle_codex_slash_command(text, user_id)
+    elif backend == "dsh":
+        from .dsh import handle_dsh_slash_command
+        return await handle_dsh_slash_command(text, user_id)
     else:
         from .agy import handle_slash_command
         return await handle_slash_command(text, user_id)
@@ -450,13 +457,18 @@ def _cmd_backend(args: str, user_id: str) -> str:
         prefs = load_prefs(user_id)
         current = prefs.get("backend", config.backend)
         model_label = format_model_label(prefs.get("model", ""))
+        backend_list = " / ".join(f"`{b}`" for b in KNOWN_BACKENDS)
         return (
             f"📋 **当前助手引擎** 📋\n\n`{current}`\n"
             f"模型: `{model_label}`\n\n"
-            "用法: `/backend agy` 或 `/backend grok` 或 `/backend codex`"
+            f"用法: `/backend {backend_list}`"
         )
-    if name not in ("agy", "grok", "codex"):
-        return "❌ **未知引擎** ❌\n\n支持: `agy` / `grok` / `codex`\n\n`/backend agy` 或 `/backend grok` 或 `/backend codex`"
+    if name not in KNOWN_BACKENDS:
+        backend_list = " / ".join(f"`{b}`" for b in KNOWN_BACKENDS)
+        return (
+            f"❌ **未知引擎** ❌\n\n支持: {backend_list}\n\n"
+            f"`/backend {'` 或 `/backend '.join(KNOWN_BACKENDS)}`"
+        )
     prefs = load_prefs(user_id)
     old, new = switch_backend_prefs(prefs, name)
     save_prefs(user_id, prefs)
@@ -660,6 +672,11 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
     elif backend == "codex":
         # codex runs with cwd=session_dir; file_change paths may also land in
         # user-approved --add-dir roots, so allow those too.
+        allowed_root = session_dir
+    elif backend == "dsh":
+        # dsh runs with cwd=session_dir (per-user workspace); artifacts are
+        # files the model created there. DSH_HOME sessions live outside the
+        # per-user tree (machine-wide ~/.dsh), so they never match anyway.
         allowed_root = session_dir
     else:
         # agy writes to .gemini/antigravity-cli/scratch under session_dir

@@ -681,7 +681,7 @@ upstream_guard = UpstreamGuard()
 # Per-user preference persistence (per-backend model/effort/mode memory)
 # ---------------------------------------------------------------------------
 
-KNOWN_BACKENDS = ("agy", "grok", "codex")
+KNOWN_BACKENDS = ("agy", "grok", "codex", "dsh")
 BACKEND_SCOPED_KEYS = ("model", "effort", "mode")
 
 
@@ -1005,6 +1005,8 @@ _SESSION_TEMP_REL_DIRS = (
     os.path.join(".gemini", "antigravity-cli", "cache"),
     os.path.join(".grok", "logs"),
     os.path.join(".codex", "logs"),
+    os.path.join(".dsh", "logs"),
+    os.path.join(".dsh", "cache"),
 )
 
 # Dialogue history — cleaned as *units* (never split SQLite sidecars / session trees).
@@ -1015,6 +1017,7 @@ _HISTORY_BRAIN_REL = os.path.join(".gemini", "antigravity-cli", "brain")
 _HISTORY_KNOWLEDGE_REL = os.path.join(".gemini", "antigravity-cli", "knowledge")
 _HISTORY_GROK_SESSIONS_REL = os.path.join(".grok", "sessions")
 _HISTORY_CODEX_SESSIONS_REL = os.path.join(".codex", "sessions")
+_HISTORY_DSH_SESSIONS_REL = os.path.join(".dsh", "sessions")
 
 _SESSION_HISTORY_REL_DIRS = (
     _HISTORY_CONVERSATIONS_REL,
@@ -1022,6 +1025,7 @@ _SESSION_HISTORY_REL_DIRS = (
     _HISTORY_KNOWLEDGE_REL,
     _HISTORY_GROK_SESSIONS_REL,
     _HISTORY_CODEX_SESSIONS_REL,
+    _HISTORY_DSH_SESSIONS_REL,
 )
 
 # SQLite sidecar suffixes that must share fate with the main ``*.db`` file.
@@ -1400,6 +1404,11 @@ def _clean_user_history(user_dir: str, cutoff: float) -> int:
     )
     removed += _clean_codex_sessions(
         os.path.join(user_dir, _HISTORY_CODEX_SESSIONS_REL), cutoff
+    )
+    # dsh flushes one session tree per run under .dsh/sessions/<cwd-key>/<id>/
+    # — same bucket layout as grok, so the same unit-based cleaner applies.
+    removed += _clean_grok_sessions(
+        os.path.join(user_dir, _HISTORY_DSH_SESSIONS_REL), cutoff
     )
     return removed
 

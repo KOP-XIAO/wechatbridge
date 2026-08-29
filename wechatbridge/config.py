@@ -143,9 +143,9 @@ class AppConfig:
     # iLink base URL (no trailing slash)
     ilink_base_url: str = os.getenv("ILINK_BASE_URL", "https://ilinkai.weixin.qq.com")
 
-    # Active CLI backend: "agy", "grok", or "codex" (global default, can be overridden per-user via /backend)
+    # Active CLI backend: "agy", "grok", "codex", or "dsh" (global default, can be overridden per-user via /backend)
     backend: str = os.getenv("WECHATBRIDGE_BACKEND", "agy").lower()
-    if backend not in ("agy", "grok", "codex"):
+    if backend not in ("agy", "grok", "codex", "dsh"):
         logger.warning("Unknown backend %r, falling back to 'agy'", backend)
         backend = "agy"
 
@@ -157,6 +157,21 @@ class AppConfig:
 
     # codex CLI binary path
     codex_binary_path: str = os.getenv("CODEX_BIN_PATH", "codex")  # default assumes in PATH
+
+    # dsh (DeepSeek Harness) CLI binary path
+    dsh_binary_path: str = os.getenv("DSH_BIN_PATH", "dsh")  # default assumes in PATH
+
+    # dsh profile booted for one-shot tasks. The headless profile answers a
+    # single task, prints the final assistant message, and exits.
+    dsh_profile: str = os.getenv("DSH_PROFILE", "headless")
+
+    # dsh execution timeout (seconds)
+    dsh_timeout: int = _env_int("DSH_TIMEOUT", 600)
+
+    # Explicit DSH_HOME passed to the dsh child process. Empty = machine-wide
+    # default (~/.dsh): profiles and credentials are shared host-wide (same
+    # model as the grok backend's machine-wide login).
+    dsh_home: str = os.getenv("WECHATBRIDGE_DSH_HOME", "")
 
     # Instance name (for multi-instance deployments)
     instance: str = _instance
