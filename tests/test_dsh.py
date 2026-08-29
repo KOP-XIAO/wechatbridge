@@ -407,11 +407,13 @@ class TestRunDshIntegration(unittest.IsolatedAsyncioTestCase, _DshIntegrationBas
             await self._run("one", mode="ok")
             await self._run("two", mode="ok")
         with open(log, encoding="utf-8") as f:
-            lines = f.read().strip().splitlines()
-        self.assertEqual(len(lines), 2)
-        for line in lines:
-            self.assertNotIn("resume", line)
-            self.assertIn("--profile headless", line)
+            content = f.read()
+        # 第二条 prompt 带换行（记忆上下文），按 invoked 计数而非 splitlines
+        invocations = content.split("invoked mode=")[1:]
+        self.assertEqual(len(invocations), 2)
+        for inv in invocations:
+            self.assertNotIn("resume", inv)
+            self.assertIn("--profile headless", inv)
 
     async def test_prompt_starting_with_dash_help(self):
         log = os.path.join(self.td, "dsh-help.log")
@@ -592,6 +594,16 @@ class TestDshSpawnEnv(unittest.IsolatedAsyncioTestCase, _DshIntegrationBase):
 
 
 class TestDshSlashCommands(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        from wechatbridge.config import config
+        self._td = tempfile.mkdtemp()
+        self.addCleanup(lambda: _rmtree(self._td))
+        self._patcher = mock.patch.object(config, "session_base_dir", self._td)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+
     async def _handle(self, text, user_id="u-slash"):
         from wechatbridge.dsh import handle_dsh_slash_command
         return await handle_dsh_slash_command(text, user_id)
@@ -601,11 +613,17 @@ class TestDshSlashCommands(unittest.IsolatedAsyncioTestCase):
         self.assertIn("dsh", out)
         self.assertIn("/backend", out)
 
-    async def test_clear_is_single_turn_notice(self):
-        out = await self._handle("/clear")
-        self.assertIn("单轮", out)
-        out2 = await self._handle("/new")
-        self.assertIn("单轮", out2)
+    async def test_clear_clears_memory(self):
+        # 无记忆时提示没有可清空的
+        out = await self._handle("/clear", user_id="u-clear")
+        self.assertIn("记忆", out)
+        # 写入记忆后再清
+        from wechatbridge.dsh import append_memory, load_memory
+        append_memory("u-clear", "hello", "hi there")
+        self.assertEqual(len(load_memory("u-clear")), 2)
+        out2 = await self._handle("/new", user_id="u-clear")
+        self.assertIn("已清空", out2)
+        self.assertEqual(load_memory("u-clear"), [])
 
     async def test_model_commands_not_supported(self):
         for cmd in ("/model gemini-3", "/models", "/fast", "/planning", "/persona hi", "/add-dir /tmp", "/agents"):
@@ -646,6 +664,106 @@ class TestDshBackendRegistration(unittest.TestCase):
         from wechatbridge.runner_common import default_prefs
         prefs = default_prefs()
         self.assertIn("dsh", prefs["by_backend"])
+
+
+class TestDshMemory(unittest.TestCase):
+    """Bridge-managed long-term memory for the single-turn dsh backend."""
+
+    def setUp(self):
+        from wechatbridge.config import config
+        self.td = tempfile.mkdtemp()
+        self.addCleanup(lambda: _rmtree(self.td))
+        self._patchers = []
+        p = mock.patch.object(config, "session_base_dir", self.td)
+        p.start(); self._patchers.append(p)
+        p2 = mock.patch.object(config, "dsh_memory_turns", 3)
+        p2.start(); self._patchers.append(p2)
+        p3 = mock.patch.object(config, "dsh_memory_chars", 200)
+        p3.start(); self._patchers.append(p3)
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+
+    def test_append_load_roundtrip(self):
+        from wechatbridge.dsh import append_memory, load_memory, _memory_path
+        self.assertFalse(os.path.isfile(_memory_path("u-mem")))
+        append_memory("u-mem", "你好", "你好！有什么可以帮你？")
+        turns = load_memory("u-mem")
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0]["role"], "user")
+        self.assertEqual(turns[0]["text"], "你好")
+        self.assertEqual(turns[1]["role"], "assistant")
+
+    def test_memory_trimmed_to_turns(self):
+        from wechatbridge.dsh import append_memory, load_memory
+        for i in range(5):
+            append_memory("u-mem2", f"q{i}", f"a{i}")
+        turns = load_memory("u-mem2")
+        # dsh_memory_turns=3 → 最近 3 对 = 6 条
+        self.assertEqual(len(turns), 6)
+        self.assertEqual(turns[0]["text"], "q2")
+        self.assertEqual(turns[-1]["text"], "a4")
+
+    def test_format_context_truncates_chars(self):
+        from wechatbridge.dsh import format_context
+        memory = [{"role": "user", "text": "x" * 150}, {"role": "assistant", "text": "y" * 150}]
+        ctx = format_context(memory, max_chars=200)
+        self.assertLessEqual(len(ctx), 200)
+        self.assertIn("助手", ctx)
+        self.assertIn("y" * 10, ctx)
+
+    def test_build_prompt_injects_context(self):
+        from wechatbridge.dsh import append_memory, build_prompt_with_context
+        append_memory("u-mem3", "我叫小明", "好的小明！")
+        full = build_prompt_with_context("我刚刚说了什么？", "u-mem3")
+        self.assertIn("对话记忆", full)
+        self.assertIn("我叫小明", full)
+        self.assertIn("好的小明", full)
+        self.assertIn("我刚刚说了什么？", full)
+
+    def test_build_prompt_no_memory(self):
+        from wechatbridge.dsh import build_prompt_with_context
+        self.assertEqual(build_prompt_with_context("hi", "u-none"), "hi")
+
+    def test_clear_memory(self):
+        from wechatbridge.dsh import append_memory, clear_memory, load_memory
+        append_memory("u-mem4", "a", "b")
+        self.assertTrue(clear_memory("u-mem4"))
+        self.assertEqual(load_memory("u-mem4"), [])
+        self.assertFalse(clear_memory("u-mem4"))
+
+
+class TestRunDshMemoryIntegration(unittest.IsolatedAsyncioTestCase, _DshIntegrationBase):
+    """Second message must carry the first turn's context (continuity)."""
+
+    def setUp(self):
+        self._setUp()
+
+    def tearDown(self):
+        self._tearDown()
+
+    async def test_second_call_injects_memory(self):
+        log = os.path.join(self.td, "dsh.log")
+        with mock.patch.dict(os.environ, {"FAKE_DSH_LOG": log}, clear=False):
+            await self._run("我是小明", mode="ok")
+            await self._run("我叫什么名字？", mode="ok")
+        with open(log, encoding="utf-8") as f:
+            content = f.read()
+        invocations = content.split("invoked mode=")[1:]
+        self.assertEqual(len(invocations), 2)
+        # 第二次调用的 prompt 必须带上第一次对话的记忆
+        self.assertIn("我是小明", invocations[1])
+        self.assertIn("我叫什么名字？", invocations[1])
+
+    async def test_memory_file_persisted(self):
+        from wechatbridge.dsh import load_memory
+        await self._run("第一句", mode="ok")
+        await self._run("第二句", mode="ok")
+        turns = load_memory("u-dsh")
+        # 两轮对话 = 4 条（user+assistant × 2）
+        self.assertEqual(len(turns), 4)
+        self.assertEqual(turns[0]["text"], "第一句")
 
 
 def config_session_dir():

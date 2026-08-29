@@ -47,7 +47,7 @@ Per-user switch: `/backend agy`, `/backend grok`, `/backend codex`, or `/backend
 
 ### dsh backend notes
 
-- **Single-turn:** the `headless` profile always creates a fresh session per invocation (`session-<uuid>`), so every WeChat message starts a new dsh session. `/clear` / `/new` are accepted but are no-ops, and `/model`, `/fast`, `/planning`, `/persona`, `/add-dir` are not wired yet (they return a short "not supported" notice).
+- **Single-turn session + bridge-managed memory:** the `headless` profile always creates a fresh session per invocation (`session-<uuid>`), so the bridge itself keeps the user's recent turns (default last 10) in a per-user `dsh_memory.jsonl` and injects them into every prompt — conversation continuity and long-term memory are preserved across messages without restart. `/clear` / `/new` wipe that memory to start fresh. `/model`, `/fast`, `/planning`, `/persona`, `/add-dir` are not wired yet (they return a short "not supported" notice).
 - Runs `dsh --profile headless -- <prompt>` with `cwd` = the per-user session directory (per-user workspace; model-created files land there and can be sent back via CDN).
 - Image and file attachments are merged into the prompt text as `@/absolute/path` mentions. Verified in dsh v0.1.1-rc.2: `headless` passes the prompt text directly to the model without pre-reading or inlining mentions; the model receives system guidance on @-paths and may invoke file tools (e.g. `read`) if needed. The bridge only filters out-of-bounds mentions starting with absolute paths, `~`, or `file://` (`@/abs`, `@~/x`, `@file://`, replaced with `[blocked-path]`), which is best-effort prompt text filtering rather than a sandbox boundary.
 - Auth / profiles are **machine-wide** (`~/.dsh`, same model as grok's machine-wide login): the child's `HOME` points at the per-user session dir, so the bridge always passes `DSH_HOME` explicitly. Set `WECHATBRIDGE_DSH_HOME` to configure a dedicated service home with automatic session retention cleanup; when unset, it reuses the host `~/.dsh` without automatic session cleanup (managed by the operator). `DSH_BIN_PATH`, `DSH_PROFILE`, and `DSH_TIMEOUT` are configurable.
@@ -146,6 +146,8 @@ Key variables (all have defaults):
 | `DSH_BIN_PATH` | `dsh` | path to the dsh binary |
 | `DSH_PROFILE` | `headless` | dsh profile booted for one-shot tasks |
 | `DSH_TIMEOUT` | `600` | dsh CLI run timeout in seconds |
+| `WECHATBRIDGE_DSH_MEMORY_TURNS` | `10` | dsh backend: recent user+assistant turns injected as context |
+| `WECHATBRIDGE_DSH_MEMORY_CHARS` | `6000` | dsh backend: max chars of injected memory context |
 | `WECHATBRIDGE_DSH_HOME` | _empty_ | explicit `DSH_HOME` passed to the dsh child. Explicitly set = dedicated home + auto session cleanup; unset = reuse host `~/.dsh` without auto cleanup |
 | `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok` / `codex` / `dsh`; overridable per user via `/backend`) |
 | `WECHATBRIDGE_INSTANCE` | `default` | instance name; state / session / QR paths derive from it |
@@ -270,7 +272,7 @@ Other `/…` commands are either rejected (e.g. `/exit`), reported as unsupporte
 
 - Not a standalone agent — requires agy and/or grok and/or codex and/or dsh.
 - The **codex** backend is not yet verified against a real Codex subscription/CLI; it is validated by source research, a JSONL fixture, and a fake CLI in tests. Treat it as community-tested until a real user confirms.
-- The **dsh** backend is single-turn only (the `headless` profile always starts a fresh session) and has not yet been verified against a real `dsh login` + headless run; it is validated against the published headless bundle contract and a fake CLI in tests.
+- The **dsh** backend runs a fresh `headless` session per message; continuity is provided by bridge-injected memory (last `WECHATBRIDGE_DSH_MEMORY_TURNS` turns, bounded by `WECHATBRIDGE_DSH_MEMORY_CHARS`) — so it is not a persistent agent process with tool-state continuity. Verified against a real `dsh login` + headless run and the test suite.
 - dsh model/effort/mode/persona slash commands are not wired yet; `/model`, `/fast`, `/planning`, `/persona`, `/add-dir` return a "not supported" notice on the dsh backend.
 - Voice is WeChat speech-to-text only; no local ASR; empty transcript → “type instead”.
 - No video send/receive; no native WeChat voice-bubble replies (no silk encode).

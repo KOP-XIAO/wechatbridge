@@ -173,6 +173,14 @@ class AppConfig:
     # model as the grok backend's machine-wide login).
     dsh_home: str = os.getenv("WECHATBRIDGE_DSH_HOME", "")
 
+    # Bridge-managed long-term memory for the dsh backend. The headless
+    # profile always starts a fresh session, so the bridge injects the user's
+    # recent conversation history into every prompt to keep continuity.
+    # Number of recent turns (user+assistant pairs) injected as context.
+    dsh_memory_turns: int = _env_int("WECHATBRIDGE_DSH_MEMORY_TURNS", 10)
+    # Max characters of injected memory context (older turns are dropped first).
+    dsh_memory_chars: int = _env_int("WECHATBRIDGE_DSH_MEMORY_CHARS", 6000)
+
     # Instance name (for multi-instance deployments)
     instance: str = _instance
 

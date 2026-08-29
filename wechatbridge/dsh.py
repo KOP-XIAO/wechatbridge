@@ -21,6 +21,7 @@ the background cleanup runner based on age (cutoff).
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -65,6 +66,110 @@ def _host_dsh_home() -> str:
     """
     return host_dsh_home()
 
+
+# ---------------------------------------------------------------------------
+# Bridge-managed long-term memory (per WeChat user)
+#
+# dsh's headless profile always starts a fresh session, so continuity must be
+# provided by the bridge: we keep the user's recent turns in a small JSONL
+# file under the per-user session dir and inject them into every prompt.
+# ---------------------------------------------------------------------------
+
+_MEMORY_FILE = "dsh_memory.jsonl"
+
+
+def _memory_path(user_id: str) -> str:
+    """Path of the per-user dsh memory file."""
+    return os.path.join(ensure_session_dir(user_id), _MEMORY_FILE)
+
+
+def load_memory(user_id: str) -> list[dict]:
+    """Load the user's recent dsh turns: [{"role": "user"|"assistant", "text": ...}, ...].
+
+    Returns the newest ``WECHATBRIDGE_DSH_MEMORY_TURNS`` pairs (older dropped).
+    Malformed lines are ignored.
+    """
+    path = _memory_path(user_id)
+    turns: list[dict] = []
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("role") in ("user", "assistant") and isinstance(obj.get("text"), str):
+                        turns.append({"role": obj["role"], "text": obj["text"]})
+    except OSError as e:
+        logger.warning("Failed to load dsh memory for %s: %s", user_id, e)
+    max_turns = max(1, int(getattr(config, "dsh_memory_turns", 10) or 10)) * 2
+    return turns[-max_turns:]
+
+
+def append_memory(user_id: str, user_text: str, assistant_text: str) -> None:
+    """Persist one user+assistant turn to the per-user memory file."""
+    path = _memory_path(user_id)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            for role, text in (("user", user_text), ("assistant", assistant_text)):
+                f.write(json.dumps({"role": role, "text": text}, ensure_ascii=False) + "\n")
+    except OSError as e:
+        logger.warning("Failed to append dsh memory for %s: %s", user_id, e)
+
+
+def clear_memory(user_id: str) -> bool:
+    """Wipe the per-user dsh memory file. Returns True when something was removed."""
+    path = _memory_path(user_id)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except OSError as e:
+        logger.warning("Failed to clear dsh memory for %s: %s", user_id, e)
+    return False
+
+
+def format_context(memory: list[dict], max_chars: int = 0) -> str:
+    """Render the memory turns as an injectable context block.
+
+    Newest turns first, truncated to *max_chars* characters (default:
+    ``WECHATBRIDGE_DSH_MEMORY_CHARS``) by dropping the oldest content.
+    """
+    max_chars = max_chars or int(getattr(config, "dsh_memory_chars", 6000) or 6000)
+    if not memory:
+        return ""
+    parts = []
+    for turn in reversed(memory):
+        label = "用户" if turn["role"] == "user" else "助手"
+        parts.append(f"{label}：{turn['text']}")
+    text = "\n".join(parts)
+    while len(text) > max_chars and len(parts) > 1:
+        parts.pop()
+        text = "\n".join(parts)
+    return text[:max_chars]
+
+
+def build_prompt_with_context(prompt: str, user_id: str) -> str:
+    """Inject the user's recent memory into the prompt for continuity.
+
+    Returns the full prompt (context + fresh question). The fresh question is
+    always appended in full; memory is bounded by format_context.
+    """
+    memory = load_memory(user_id)
+    ctx = format_context(memory)
+    if not ctx:
+        return prompt
+    return (
+        "【对话记忆】以下是此前与这位用户的对话记录（越靠后越新）：\n"
+        f"{ctx}\n\n"
+        "请基于以上对话记忆回答用户的最新问题，延续之前的语气、风格与信息，"
+        "不要重复已讨论过的内容。\n\n"
+        f"【最新问题】{prompt}"
+    )
 
 _DSH_SKIP_DIR_NAMES = frozenset({
     ".dsh",
@@ -312,12 +417,20 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
 
     first = is_first_message(session_dir, backend="dsh")
 
-    safe_prompt = _sanitize_prompt_at_paths(prompt, session_dir)
+    # Bridge-managed long-term memory: inject the user's recent turns so the
+    # fresh headless session still has conversation continuity. The danger gate
+    # above only ever sees the raw user prompt (never the injected context).
+    full_prompt = build_prompt_with_context(prompt, user_id)
+    if len(full_prompt.encode("utf-8", errors="replace")) > _MAX_ARG_BYTES:
+        logger.warning("Full prompt (with memory) too large for argv from user %s; dropping context", user_id)
+        full_prompt = prompt
+
+    safe_prompt = _sanitize_prompt_at_paths(full_prompt, session_dir)
     cmd = _build_dsh_command(safe_prompt)
 
     logger.info(
-        "Running dsh for user %s (first=%s): %s",
-        user_id, first, " ".join(cmd[:3]) + " ...",
+        "Running dsh for user %s (first=%s, memory_chars=%d): %s",
+        user_id, first, len(full_prompt) - len(prompt), " ".join(cmd[:3]) + " ...",
     )
 
 
@@ -372,6 +485,10 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         if first and display != EMPTY_REPLY and not is_bridge_formatted_reply(display):
             mark_initialized(session_dir, backend="dsh")
 
+        # Persist the turn into long-term memory for continuity on next message.
+        if display != EMPTY_REPLY and not is_bridge_formatted_reply(display):
+            append_memory(user_id, prompt, display)
+
         elapsed = time.time() - t0
         logger.info(
             "dsh done: user=%s elapsed=%.1fs artifacts=%d output=%d chars",
@@ -412,11 +529,12 @@ def _cmd_help() -> str:
         "📋 **wechatbridge 支持指令 (dsh)** 📋",
         "",
         "**引擎说明**",
-        "- dsh 为**单轮模式**：每次提问都会开启全新会话",
+        "- dsh 为**单轮会话 + 桥接记忆**：每次调用开启新会话，但会带上",
+        "  你最近的对话记录（默认最近 10 轮），保持连续对话与记忆",
         "- `/backend <agy|grok|codex|dsh>` — 切换助手引擎",
         "",
         "**对话控制**",
-        "- `/clear` 或 `/new` — dsh 单轮模式无需重置（指令已接受）",
+        "- `/clear` 或 `/new` — **清空本用户的对话记忆**，重新开始",
         "",
         "**其他**",
         "- `/help` — 显示本帮助",
@@ -464,7 +582,13 @@ async def handle_dsh_slash_command(text: str, user_id: str) -> str | None:
         return _cmd_help()
 
     if cmd in ("/clear", "/new"):
-        return "ℹ️ **dsh 为单轮模式** ℹ️\n\n每次提问都会开启全新会话，无需重置。"
+        cleared = clear_memory(user_id)
+        return (
+            "✅ **对话记忆已清空** ✅\n\n"
+            "下次提问将不带任何历史上下文，重新开始。"
+            if cleared
+            else "ℹ️ **当前没有可清空的对话记忆** ℹ️"
+        )
 
     # v1: model / effort / mode / persona are not wired to dsh yet.
     # /agent and /backend are meta-commands handled in main.py.

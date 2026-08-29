@@ -47,7 +47,7 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 
 ### dsh 后端说明
 
-- **单轮模式：** `headless` profile 每次调用都新建会话（`session-<uuid>`），所以每条微信消息都会开启全新 dsh 会话。`/clear` / `/new` 接受但无实际作用；`/model`、`/fast`、`/planning`、`/persona`、`/add-dir` 暂未接通（会返回"暂不支持"提示）。
+- **单轮会话 + 桥接记忆：** `headless` profile 每次调用都新建会话（`session-<uuid>`），所以由桥本身为每用户保存最近对话（默认最近 10 轮，存于每用户 `dsh_memory.jsonl`）并注入每次提问——跨消息保持连续对话与长期记忆。`/clear` / `/new` 会清空该记忆重新开始；`/model`、`/fast`、`/planning`、`/persona`、`/add-dir` 暂未接通（会返回"暂不支持"提示）。
 - 以 `dsh --profile headless -- <提示>` 运行，`cwd` = 每用户会话目录（每用户工作区；模型生成的文件落在那里，可经 CDN 回传）。
 - 图片/文件附件对 dsh 以 @绝对路径 文本并入 prompt。经 dsh v0.1.1-rc.2 源码验证：`headless` profile 不会在 CLI/运行时层面预读取或内联 @mention 文件，而是将 prompt 作为纯文本直接提交给模型，模型依赖系统提示感知 @ 路径并在需要时自行调用 `read` 等工具；桥仅拦截绝对路径与 ~ 开头的越界 mention（`@/abs`、`@~/x`、`@file://`，替换为 `[blocked-path]`），是 prompt 文本层的 best-effort 过滤，不是沙箱边界。
 - 认证 / profile 为**机器级共享**（`~/.dsh`，与 grok 机器级登录同模型）：子进程 `HOME` 指向每用户会话目录，所以桥总是显式传 `DSH_HOME`。显式设置 `WECHATBRIDGE_DSH_HOME` 时使用专用主目录并开启自动会话保留清理；未设置时复用宿主 `~/.dsh`，不执行自动会话清理，由操作员自行管理。`DSH_BIN_PATH`、`DSH_PROFILE`、`DSH_TIMEOUT` 均可配置。
@@ -146,6 +146,8 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 | `DSH_BIN_PATH` | `dsh` | dsh 可执行文件路径 |
 | `DSH_PROFILE` | `headless` | dsh 单轮任务启动的 profile |
 | `DSH_TIMEOUT` | `600` | dsh CLI 执行超时秒数 |
+| `WECHATBRIDGE_DSH_MEMORY_TURNS` | `10` | dsh 后端：注入上下文的最近对话轮数（user+assistant 对） |
+| `WECHATBRIDGE_DSH_MEMORY_CHARS` | `6000` | dsh 后端：注入记忆上下文的字符上限 |
 | `WECHATBRIDGE_DSH_HOME` | _空_ | 传给 dsh 子进程的显式 `DSH_HOME`。显式设置 = 专用目录+自动会话清理；未设 = 复用宿主 `~/.dsh` 且不自动清理 |
 | `WECHATBRIDGE_BACKEND` | `agy` | 全局默认后端（`agy` / `grok` / `codex` / `dsh`，可被 `/backend` 按用户覆盖） |
 | `WECHATBRIDGE_INSTANCE` | `default` | 实例名；state / 会话 / 二维码路径由它派生 |
@@ -270,7 +272,7 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 
 - 依赖 agy 和/或 grok 和/或 codex 和/或 dsh，本身不是独立 agent。
 - **codex** 后端尚未在真实 Codex 订阅/CLI 上实测，仅经源码研究、JSONL fixture 与 fake CLI 测试验证，暂视为社区测试，待真实用户确认。
-- **dsh** 后端为单轮模式（`headless` profile 每次都是新会话），且尚未在真实 `dsh login` + headless 上实测，目前基于已发布的 headless bundle 契约与测试用 fake CLI 验证。
+- **dsh** 后端每条消息都跑全新的 `headless` 会话；连续性由桥注入的记忆提供（最近 `WECHATBRIDGE_DSH_MEMORY_TURNS` 轮、受 `WECHATBRIDGE_DSH_MEMORY_CHARS` 限制）——因此不是带工具状态连续性的常驻 agent 进程。已通过真实 `dsh login` + headless 实测与测试套件验证。
 - dsh 的模型 / 强度 / 模式 / 人格 slash 指令尚未接通；`/model`、`/fast`、`/planning`、`/persona`、`/add-dir` 在 dsh 后端会返回"暂不支持"提示。
 - 语音只靠微信转写；无本地 ASR；转写为空会提示改打字。
 - 不收发视频；不回原生语音气泡（未做 silk 编码）。
