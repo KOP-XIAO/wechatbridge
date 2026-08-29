@@ -148,6 +148,7 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 | `DSH_TIMEOUT` | `600` | dsh CLI 执行超时秒数 |
 | `WECHATBRIDGE_DSH_MEMORY_TURNS` | `10` | dsh 后端：注入上下文的最近对话轮数（user+assistant 对） |
 | `WECHATBRIDGE_DSH_MEMORY_CHARS` | `6000` | dsh 后端：注入记忆上下文的字符上限 |
+| `WECHATBRIDGE_DSH_RESUME` | `false` | dsh 后端：常驻会话模式——每用户一个 dsh 会话，每条消息恢复同一会话（codex 式）；需在 headless profile 挂载 dsh-bridge-runner 插件；启用时跳过窗口记忆 |
 | `WECHATBRIDGE_DSH_HOME` | _空_ | 传给 dsh 子进程的显式 `DSH_HOME`。显式设置 = 专用目录+自动会话清理；未设 = 复用宿主 `~/.dsh` 且不自动清理 |
 | `WECHATBRIDGE_BACKEND` | `agy` | 全局默认后端（`agy` / `grok` / `codex` / `dsh`，可被 `/backend` 按用户覆盖） |
 | `WECHATBRIDGE_INSTANCE` | `default` | 实例名；state / 会话 / 二维码路径由它派生 |

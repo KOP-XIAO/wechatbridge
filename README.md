@@ -148,6 +148,7 @@ Key variables (all have defaults):
 | `DSH_TIMEOUT` | `600` | dsh CLI run timeout in seconds |
 | `WECHATBRIDGE_DSH_MEMORY_TURNS` | `10` | dsh backend: recent user+assistant turns injected as context |
 | `WECHATBRIDGE_DSH_MEMORY_CHARS` | `6000` | dsh backend: max chars of injected memory context |
+| `WECHATBRIDGE_DSH_RESUME` | `false` | dsh backend: true persistent-session mode — one dsh session per user resumed on every message (codex-style); requires the dsh-bridge-runner plugin in the headless profile; skips windowed memory when enabled |
 | `WECHATBRIDGE_DSH_HOME` | _empty_ | explicit `DSH_HOME` passed to the dsh child. Explicitly set = dedicated home + auto session cleanup; unset = reuse host `~/.dsh` without auto cleanup |
 | `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok` / `codex` / `dsh`; overridable per user via `/backend`) |
 | `WECHATBRIDGE_INSTANCE` | `default` | instance name; state / session / QR paths derive from it |
