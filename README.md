@@ -48,8 +48,9 @@ Per-user switch: `/backend agy`, `/backend grok`, `/backend codex`, or `/backend
 ### dsh backend notes
 
 - **Single-turn:** the `headless` profile always creates a fresh session per invocation (`session-<uuid>`), so every WeChat message starts a new dsh session. `/clear` / `/new` are accepted but are no-ops, and `/model`, `/fast`, `/planning`, `/persona`, `/add-dir` are not wired yet (they return a short "not supported" notice).
-- Runs `dsh --profile headless <prompt>` with `cwd` = the per-user session directory (per-user workspace; model-created files land there and can be sent back via CDN).
-- Auth / profiles are **machine-wide** (`~/.dsh`, same model as grok's machine-wide login): the child's `HOME` points at the per-user session dir, so the bridge always passes `DSH_HOME` explicitly. Override with `WECHATBRIDGE_DSH_HOME` (e.g. a dedicated service home; for per-user `DSH_HOME` isolation, pre-seed profiles there). `DSH_BIN_PATH`, `DSH_PROFILE`, and `DSH_TIMEOUT` are configurable.
+- Runs `dsh --profile headless -- <prompt>` with `cwd` = the per-user session directory (per-user workspace; model-created files land there and can be sent back via CDN).
+- Image and file attachments are merged into the prompt text as `@/absolute/path` mentions only; whether the `headless` profile reads them has not been verified. The bridge blocks `@/absolute/path` mentions pointing outside the session directory (replaced with `[blocked-path]`).
+- Auth / profiles are **machine-wide** (`~/.dsh`, same model as grok's machine-wide login): the child's `HOME` points at the per-user session dir, so the bridge always passes `DSH_HOME` explicitly. Set `WECHATBRIDGE_DSH_HOME` to configure a dedicated service home with automatic session retention cleanup; when unset, it reuses the host `~/.dsh` without automatic session cleanup (managed by the operator). `DSH_BIN_PATH`, `DSH_PROFILE`, and `DSH_TIMEOUT` are configurable.
 - Status: implemented from the published `dsh` CLI contract (headless bundle source) plus a fake CLI in the test suite; final acceptance depends on a real `dsh login` + headless run.
 
 ### Grok backend notes
@@ -145,7 +146,7 @@ Key variables (all have defaults):
 | `DSH_BIN_PATH` | `dsh` | path to the dsh binary |
 | `DSH_PROFILE` | `headless` | dsh profile booted for one-shot tasks |
 | `DSH_TIMEOUT` | `600` | dsh CLI run timeout in seconds |
-| `WECHATBRIDGE_DSH_HOME` | _empty_ | explicit `DSH_HOME` passed to the dsh child (empty = machine-wide `~/.dsh`) |
+| `WECHATBRIDGE_DSH_HOME` | _empty_ | explicit `DSH_HOME` passed to the dsh child. Explicitly set = dedicated home + auto session cleanup; unset = reuse host `~/.dsh` without auto cleanup |
 | `WECHATBRIDGE_BACKEND` | `agy` | global default backend (`agy` / `grok` / `codex` / `dsh`; overridable per user via `/backend`) |
 | `WECHATBRIDGE_INSTANCE` | `default` | instance name; state / session / QR paths derive from it |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _empty_ | comma-separated WeChat IDs (empty = allow all) |

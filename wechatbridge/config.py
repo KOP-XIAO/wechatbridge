@@ -330,3 +330,31 @@ def ensure_runtime_dirs() -> None:
             os.chmod(path, 0o700)
         except OSError as e:
             logger.warning("Failed to ensure runtime dir %s: %s", path, e)
+
+
+def _normalized_dsh_home() -> tuple[bool, str]:
+    """Single normalization helper for DSH_HOME.
+
+    Returns:
+        tuple[bool, str]: (is_explicit, normalized_abs_path)
+    """
+    raw = getattr(config, "dsh_home", "")
+    val = raw.strip() if raw else ""
+    if not val:
+        host_home = os.environ.get("WECHATBRIDGE_HOST_HOME") or os.path.expanduser("~")
+        return False, os.path.abspath(os.path.join(host_home, ".dsh"))
+    return True, os.path.abspath(os.path.expanduser(val))
+
+
+def host_dsh_home() -> str:
+    """Machine-wide DeepSeek Harness home used by dsh child process and session cleanup.
+
+    Precedence: ``WECHATBRIDGE_DSH_HOME`` (config.dsh_home) > ``WECHATBRIDGE_HOST_HOME``/``~``.
+    """
+    return _normalized_dsh_home()[1]
+
+
+def is_dsh_home_explicit() -> bool:
+    """True when WECHATBRIDGE_DSH_HOME (config.dsh_home) was explicitly configured."""
+    return _normalized_dsh_home()[0]
+

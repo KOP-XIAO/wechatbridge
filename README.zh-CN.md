@@ -48,8 +48,9 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 ### dsh 后端说明
 
 - **单轮模式：** `headless` profile 每次调用都新建会话（`session-<uuid>`），所以每条微信消息都会开启全新 dsh 会话。`/clear` / `/new` 接受但无实际作用；`/model`、`/fast`、`/planning`、`/persona`、`/add-dir` 暂未接通（会返回"暂不支持"提示）。
-- 以 `dsh --profile headless <提示>` 运行，`cwd` = 每用户会话目录（每用户工作区；模型生成的文件落在那里，可经 CDN 回传）。
-- 认证 / profile 为**机器级共享**（`~/.dsh`，与 grok 机器级登录同模型）：子进程 `HOME` 指向每用户会话目录，所以桥总是显式传 `DSH_HOME`。可用 `WECHATBRIDGE_DSH_HOME` 覆盖（如专用服务主目录；如需按用户隔离 `DSH_HOME`，需在该目录预置 profiles）。`DSH_BIN_PATH`、`DSH_PROFILE`、`DSH_TIMEOUT` 均可配置。
+- 以 `dsh --profile headless -- <提示>` 运行，`cwd` = 每用户会话目录（每用户工作区；模型生成的文件落在那里，可经 CDN 回传）。
+- 图片/文件附件对 dsh 仅以 @绝对路径 文本并入 prompt，headless 是否读取未验证。桥对指向会话目录外的 @绝对路径 mention 进行了拦截屏蔽（替换为 `[blocked-path]`）。
+- 认证 / profile 为**机器级共享**（`~/.dsh`，与 grok 机器级登录同模型）：子进程 `HOME` 指向每用户会话目录，所以桥总是显式传 `DSH_HOME`。显式设置 `WECHATBRIDGE_DSH_HOME` 时使用专用主目录并开启自动会话保留清理；未设置时复用宿主 `~/.dsh`，不执行自动会话清理，由操作员自行管理。`DSH_BIN_PATH`、`DSH_PROFILE`、`DSH_TIMEOUT` 均可配置。
 - **状态：** 基于已发布的 dsh CLI 契约（headless bundle 源码）与测试用 fake CLI 实现；最终需由真实用户在 `dsh login` + headless 实跑后验收。
 
 ### grok 后端说明
@@ -145,7 +146,7 @@ curl -o ~/.config/wechatbridge/.env https://raw.githubusercontent.com/dorokuma/w
 | `DSH_BIN_PATH` | `dsh` | dsh 可执行文件路径 |
 | `DSH_PROFILE` | `headless` | dsh 单轮任务启动的 profile |
 | `DSH_TIMEOUT` | `600` | dsh CLI 执行超时秒数 |
-| `WECHATBRIDGE_DSH_HOME` | _空_ | 传给 dsh 子进程的显式 `DSH_HOME`（空 = 机器级 `~/.dsh`） |
+| `WECHATBRIDGE_DSH_HOME` | _空_ | 传给 dsh 子进程的显式 `DSH_HOME`。显式设置 = 专用目录+自动会话清理；未设 = 复用宿主 `~/.dsh` 且不自动清理 |
 | `WECHATBRIDGE_BACKEND` | `agy` | 全局默认后端（`agy` / `grok` / `codex` / `dsh`，可被 `/backend` 按用户覆盖） |
 | `WECHATBRIDGE_INSTANCE` | `default` | 实例名；state / 会话 / 二维码路径由它派生 |
 | `WECHATBRIDGE_ALLOWED_SENDERS` | _空_ | 允许使用的微信 ID，逗号分隔（空 = 全开） |

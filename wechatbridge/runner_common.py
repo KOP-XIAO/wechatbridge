@@ -17,7 +17,7 @@ import stat
 import sys
 import time
 
-from .config import config
+from .config import config, host_dsh_home, is_dsh_home_explicit
 
 logger = logging.getLogger("wechatbridge.runner")
 
@@ -1017,16 +1017,6 @@ _HISTORY_BRAIN_REL = os.path.join(".gemini", "antigravity-cli", "brain")
 _HISTORY_KNOWLEDGE_REL = os.path.join(".gemini", "antigravity-cli", "knowledge")
 _HISTORY_GROK_SESSIONS_REL = os.path.join(".grok", "sessions")
 _HISTORY_CODEX_SESSIONS_REL = os.path.join(".codex", "sessions")
-_HISTORY_DSH_SESSIONS_REL = os.path.join(".dsh", "sessions")
-
-_SESSION_HISTORY_REL_DIRS = (
-    _HISTORY_CONVERSATIONS_REL,
-    _HISTORY_BRAIN_REL,
-    _HISTORY_KNOWLEDGE_REL,
-    _HISTORY_GROK_SESSIONS_REL,
-    _HISTORY_CODEX_SESSIONS_REL,
-    _HISTORY_DSH_SESSIONS_REL,
-)
 
 # SQLite sidecar suffixes that must share fate with the main ``*.db`` file.
 _SQLITE_SIDECAR_TAILS = ("-wal", "-shm", "-journal")
@@ -1405,11 +1395,6 @@ def _clean_user_history(user_dir: str, cutoff: float) -> int:
     removed += _clean_codex_sessions(
         os.path.join(user_dir, _HISTORY_CODEX_SESSIONS_REL), cutoff
     )
-    # dsh flushes one session tree per run under .dsh/sessions/<cwd-key>/<id>/
-    # — same bucket layout as grok, so the same unit-based cleaner applies.
-    removed += _clean_grok_sessions(
-        os.path.join(user_dir, _HISTORY_DSH_SESSIONS_REL), cutoff
-    )
     return removed
 
 
@@ -1487,6 +1472,20 @@ def _clear_initialized_if_no_history(user_dir: str) -> dict:
             except OSError as e:
                 logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
 
+    # dsh: no per-user session history (transcripts live in host DSH_HOME/sessions);
+    # clear .initialized.dsh flag when cleaning session
+    flag = os.path.join(user_dir, ".initialized.dsh")
+    if os.path.exists(flag):
+        try:
+            os.remove(flag)
+            cleared["dsh"] = True
+            logger.info(
+                "Session cleanup: cleared .initialized.dsh for %s",
+                user_dir,
+            )
+        except OSError as e:
+            logger.warning("Session cleanup: failed to clear %s: %s", flag, e)
+
     # Legacy: clean shared .initialized if no history at all
     if not grok_has and not agy_has and not codex_has:
         flag = os.path.join(user_dir, ".initialized")
@@ -1507,7 +1506,7 @@ def clean_session_data(
     retention_days: int | None = None,
     history_retention_days: int | None = None,
 ) -> int:
-    """Remove old session artifacts under each user directory.
+    """Remove old session artifacts under each user directory and host DSH_HOME.
 
     Two TTLs:
       - Temps (default ``session_retention_days``, often 7d): file-level mtime
@@ -1517,6 +1516,8 @@ def clean_session_data(
           * agy ``conversations``: each ``*.db`` + ``*.db-wal/shm/journal`` together
           * agy ``brain`` / ``knowledge``: each top-level child tree/file
           * grok ``sessions``: each ``<cwd>/<session-id>/`` tree; top-level indexes alone
+          * codex ``sessions``: date-bucketed ``rollout-*.jsonl`` files
+          * dsh ``sessions`` (machine-wide $DSH_HOME/sessions): each ``<cwd>/<id>/`` tree
 
     Never splits a unit (prevents half-deleted SQLite DBs). Does **not** touch
     prefs, auth links, or CLI install trees.
@@ -1531,25 +1532,37 @@ def clean_session_data(
     if history_retention_days is None:
         history_retention_days = config.history_retention_days
     base = config.session_base_dir
-    if not os.path.isdir(base):
-        return 0
     now = time.time()
     temp_cutoff = now - max(int(retention_days), 0) * 86400
     hist_cutoff = now - max(int(history_retention_days), 0) * 86400
     removed = 0
-    try:
-        for name in os.listdir(base):
-            user_dir = os.path.join(base, name)
-            if not os.path.isdir(user_dir):
-                continue
-            for rel in _SESSION_TEMP_REL_DIRS:
-                removed += _remove_old_files_under(
-                    os.path.join(user_dir, rel), temp_cutoff
-                )
-            removed += _clean_user_history(user_dir, hist_cutoff)
-            _clear_initialized_if_no_history(user_dir)
-    except OSError as e:
-        logger.error("Session data cleanup error: %s", e)
+    if os.path.isdir(base):
+        try:
+            for name in os.listdir(base):
+                user_dir = os.path.join(base, name)
+                if not os.path.isdir(user_dir):
+                    continue
+                for rel in _SESSION_TEMP_REL_DIRS:
+                    removed += _remove_old_files_under(
+                        os.path.join(user_dir, rel), temp_cutoff
+                    )
+                removed += _clean_user_history(user_dir, hist_cutoff)
+                _clear_initialized_if_no_history(user_dir)
+        except OSError as e:
+            logger.error("Session data cleanup error: %s", e)
+
+    # Machine-wide dsh session history cleanup (DSH_HOME/sessions/<cwd-key>/<id>/)
+    # Only runs when WECHATBRIDGE_DSH_HOME was explicitly configured to prevent
+    # wiping operator interactive sessions under default ~/.dsh
+    if is_dsh_home_explicit():
+        try:
+            dsh_sessions = os.path.join(host_dsh_home(), "sessions")
+            if os.path.isdir(dsh_sessions):
+                removed += _clean_grok_sessions(dsh_sessions, hist_cutoff)
+        except Exception as e:
+            logger.error("DSH session cleanup error: %s", e)
+
+
     return removed
 
 

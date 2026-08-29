@@ -36,23 +36,46 @@ def main():
     args = sys.argv[1:]
     mode = os.environ.get("FAKE_DSH_MODE", "ok")
 
+    profile = ""
+    task_args = []
+    i = 0
+    in_options = True
+
+    while i < len(args):
+        arg = args[i]
+        if in_options:
+            if arg == "--":
+                in_options = False
+                i += 1
+                continue
+            if arg == "--profile":
+                if i + 1 < len(args):
+                    profile = args[i + 1]
+                    i += 2
+                    continue
+                else:
+                    sys.stderr.write("dsh: error: option --profile requires an argument\n")
+                    sys.stderr.flush()
+                    return 1
+            if arg.startswith("-"):
+                sys.stderr.write("dsh: error: unrecognized option: %s\n" % arg)
+                sys.stderr.flush()
+                return 1
+            task_args.append(arg)
+            i += 1
+        else:
+            task_args.append(arg)
+            i += 1
+
+    prompt = " ".join(task_args)
+
     log_path = os.environ.get("FAKE_DSH_LOG")
     if log_path:
         try:
             with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write("invoked mode=%s args=%s\n" % (mode, " ".join(args)))
+                lf.write("invoked mode=%s profile=%s task=%s args=%s\n" % (mode, profile, prompt, " ".join(args)))
         except OSError:
             pass
-
-    # dsh --profile headless <task>  — the task is the last positional
-    if "--profile" in args:
-        idx = args.index("--profile")
-        profile = args[idx + 1] if len(args) > idx + 1 else ""
-        task_args = args[idx + 2:]
-    else:
-        profile = ""
-        task_args = args
-    prompt = " ".join(task_args)
 
     if mode == "timeout":
         time.sleep(60)

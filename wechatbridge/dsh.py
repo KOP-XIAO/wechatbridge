@@ -3,7 +3,7 @@ dsh (DeepSeek Harness CLI) runner with per-user workspace isolation.
 
 Boots the ``headless`` profile for one-shot tasks::
 
-    dsh --profile headless "<task>"
+    dsh --profile headless -- "<task>"
 
 The headless bundle always creates a *fresh* session per invocation
 (``session-<uuid>``), prints the final assistant message to stdout, writes
@@ -11,12 +11,13 @@ The headless bundle always creates a *fresh* session per invocation
 completed.  This backend is therefore **single-turn**: every WeChat message
 starts a new dsh session, so ``/clear`` / ``/new`` are accepted but are no-ops.
 
-Isolation mirrors the grok backend: the child runs with ``cwd`` = the per-user
-session directory and ``HOME`` pointed there, while ``DSH_HOME`` stays
-machine-wide (default ``~/.dsh``) so profiles and credentials are shared
-host-wide like grok's machine-wide login.  Override with
-``WECHATBRIDGE_DSH_HOME`` to point ``DSH_HOME`` elsewhere (e.g. a dedicated
-service home, or a per-user home when you pre-seed profiles).
+Workspace isolation: the child runs with ``cwd`` = the per-user session
+directory (workspace for file artifacts) and ``HOME`` pointed there.
+``DSH_HOME`` is pointed to a machine-wide host directory (default ``~/.dsh``,
+or ``WECHATBRIDGE_DSH_HOME``) so credentials and profiles are shared host-wide.
+As a trade-off, dsh session transcripts are written to the machine-wide
+``$DSH_HOME/sessions/`` rather than per-user directories, and are expired by
+the background cleanup runner based on age (cutoff).
 """
 
 import asyncio
@@ -26,7 +27,7 @@ import re
 import time
 from urllib.parse import unquote
 
-from .config import config
+from .config import config, host_dsh_home, is_dsh_home_explicit
 from .runner_common import (
     clean_output,
     ensure_session_dir,
@@ -36,12 +37,15 @@ from .runner_common import (
     is_dangerous,
     is_first_message,
     mark_initialized,
+    path_is_under,
     sanitize_env,
     terminate_process,
     EMPTY_REPLY,
 )
 
 logger = logging.getLogger("dsh_runner")
+
+_warned_dsh_home_implicit = False
 
 # execve 单参数上限（Linux MAX_ARG_STRLEN = 128KB），留安全余量
 _MAX_ARG_BYTES = 120 * 1024
@@ -59,10 +63,46 @@ def _host_dsh_home() -> str:
     explicit ``DSH_HOME`` dsh would resolve its home under the session dir and
     find no profiles — we always pass the host home explicitly.
     """
-    if getattr(config, "dsh_home", ""):
-        return os.path.expanduser(config.dsh_home)
-    host_home = os.environ.get("WECHATBRIDGE_HOST_HOME") or os.path.expanduser("~")
-    return os.path.join(host_home, ".dsh")
+    return host_dsh_home()
+
+
+_DSH_SKIP_DIR_NAMES = frozenset({
+    ".dsh",
+    ".gemini",
+    ".codex",
+    ".grok",
+    ".git",
+    "__pycache__",
+    "node_modules",
+    "venv",
+    ".venv",
+    "cache",
+    ".cache",
+})
+
+
+_BARE_FILE_URI_RE = re.compile(r"file:///[^\s)\]}>]+")
+_TRAILING_PUNCT_CHARS = "。，！？；、：”’'\"）)]}>》」』〉…,.!?;:"
+
+
+def _parse_bare_file_uri(raw: str) -> tuple[str, str]:
+    """Parse bare file:/// URI and separate trailing CJK commentary / punctuation.
+
+    Returns:
+        tuple[str, str]: (clean_file_uri, trailing_kept_text)
+    """
+    cleaned = raw.rstrip(_TRAILING_PUNCT_CHARS)
+    punct = raw[len(cleaned):]
+    last_slash = cleaned.rfind("/")
+    cjk_kept = ""
+    if last_slash != -1:
+        basename = cleaned[last_slash + 1:]
+        if re.search(r"[a-zA-Z0-9._~%+=:-][\u4e00-\u9fff]+$", basename):
+            cjk_m = re.search(r"[\u4e00-\u9fff]+$", basename)
+            if cjk_m:
+                cjk_kept = cjk_m.group(0)
+                cleaned = cleaned[:-len(cjk_kept)]
+    return cleaned, cjk_kept + punct
 
 
 def extract_artifacts(text: str, cwd: str = "") -> list[tuple[str, str]]:
@@ -93,6 +133,10 @@ def extract_artifacts(text: str, cwd: str = "") -> list[tuple[str, str]]:
                 return  # https://, mailto:, bare names, etc.
         name = unquote(name.split("#")[0])
         path = unquote(path.split("#")[0])
+        norm_path = os.path.normpath(path)
+        parts = norm_path.split(os.sep)
+        if any(part in _DSH_SKIP_DIR_NAMES for part in parts):
+            return
         # 按路径去重（同一文件只回传一次；首个显示名优先）
         if path not in seen:
             seen.add(path)
@@ -103,9 +147,12 @@ def extract_artifacts(text: str, cwd: str = "") -> list[tuple[str, str]]:
         r"\[([^\]]+)\]\((file:///[^)\s]+|/(?:[^)\s]*)|\.\.?/[^)\s]+)\)", text
     ):
         _add(m.group(1), m.group(2))
-    # bare file:///path
-    for m in re.finditer(r"file:///([^\s)\]}>]+)", text):
-        _add(os.path.basename(m.group(1)), "file:///" + m.group(1))
+    # bare file:///path with greedy match and trailing CJK/punctuation separation
+    for m in _BARE_FILE_URI_RE.finditer(text):
+        clean_uri, _ = _parse_bare_file_uri(m.group(0))
+        path_part = clean_uri[len("file://"):]
+        if path_part.startswith("/"):
+            _add(os.path.basename(path_part), clean_uri)
 
     if result:
         logger.debug("Extracted %d artifacts: %s", len(result), [n for n, _ in result[:3]])
@@ -115,21 +162,81 @@ def extract_artifacts(text: str, cwd: str = "") -> list[tuple[str, str]]:
 def _strip_file_links(display: str) -> str:
     """Remove file:/// and absolute/relative link targets from display text
     so server paths never leak to WeChat users."""
-    return re.sub(
+    out = re.sub(
         r"\[([^\]]+)\]\((?:file:///|/|\.\.?/)[^)]+\)",
         r"[\1]",
         display,
     )
+    def _replace_bare(m: re.Match) -> str:
+        _, kept = _parse_bare_file_uri(m.group(0))
+        return kept
+
+    return _BARE_FILE_URI_RE.sub(_replace_bare, out)
+
+
+_AT_TOKEN_RE = re.compile(r"@([^\s@。，！？；、：”’'\"）)\]\}>》」』〉…]+)")
+_AT_TRAILING_PUNCT = ".,!?;:)>]}'\""
+
+
+def _sanitize_prompt_at_paths(prompt: str, session_dir: str) -> str:
+    """Replace @<path> mentions pointing outside session_dir with [blocked-path].
+
+    Recognizes @ tokens (ASCII, CJK, relative ./ and ../, ~/ and file://).
+    Path candidates outside realpath(session_dir) are replaced with [blocked-path].
+    Legitimate attachments under session_dir and non-path @mentions are preserved intact.
+
+    Known limitation:
+      Paths containing spaces are truncated at the space by token splitting
+      and will be judged as blocked paths.
+    """
+    if not prompt:
+        return ""
+
+    def _replace(m: re.Match) -> str:
+        raw_token = m.group(1)
+        clean_token = raw_token.rstrip(_AT_TRAILING_PUNCT)
+        trailing_punct = raw_token[len(clean_token):]
+
+        candidate = clean_token
+        # Determine whether token is a path candidate
+        is_candidate = (
+            candidate.startswith(("/", "./", "../", "~/"))
+            or "://" in candidate
+            or candidate.startswith("file:")
+        )
+        if not is_candidate:
+            return m.group(0)
+
+        # Resolve path candidate
+        p = candidate
+        if p.startswith("file://"):
+            p = p[len("file://"):]
+        elif p.startswith("file:"):
+            p = p[len("file:"):]
+
+        if p.startswith("~"):
+            p = os.path.expanduser(p)
+
+        if not os.path.isabs(p):
+            target_path = os.path.normpath(os.path.join(session_dir, p))
+        else:
+            target_path = p
+
+        if path_is_under(target_path, session_dir):
+            return m.group(0)
+        return "[blocked-path]" + trailing_punct
+
+    return _AT_TOKEN_RE.sub(_replace, prompt)
 
 
 def _build_dsh_command(prompt: str) -> list:
-    """Build the dsh argv: ``dsh --profile <profile> <prompt>``.
+    """Build the dsh argv: ``dsh --profile <profile> -- <prompt>``.
 
     The headless profile joins its positionals into one task, so the prompt is
-    passed as a single positional.  No continuation flag exists: headless
-    always creates a fresh session.
+    passed as a single positional preceded by ``--`` to prevent option injection.
+    No continuation flag exists: headless always creates a fresh session.
     """
-    return [config.dsh_binary_path, "--profile", config.dsh_profile, prompt]
+    return [config.dsh_binary_path, "--profile", config.dsh_profile, "--", prompt]
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +264,11 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
     if timeout is None:
         timeout = config.dsh_timeout
 
+    global _warned_dsh_home_implicit
+    if not is_dsh_home_explicit() and not _warned_dsh_home_implicit:
+        logger.warning("未设 WECHATBRIDGE_DSH_HOME，复用宿主 ~/.dsh，宿主会话保留清理已禁用")
+        _warned_dsh_home_implicit = True
+
     if len(prompt.encode("utf-8", errors="replace")) > _MAX_ARG_BYTES:
         logger.warning("Prompt too large for argv from user %s", user_id)
         return format_error(
@@ -183,11 +295,15 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         ), []
 
     first = is_first_message(session_dir, backend="dsh")
-    cmd = _build_dsh_command(prompt)
+
+    safe_prompt = _sanitize_prompt_at_paths(prompt, session_dir)
+    cmd = _build_dsh_command(safe_prompt)
+
     logger.info(
         "Running dsh for user %s (first=%s): %s",
         user_id, first, " ".join(cmd[:3]) + " ...",
     )
+
 
     process = None
     try:

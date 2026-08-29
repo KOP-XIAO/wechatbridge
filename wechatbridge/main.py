@@ -675,8 +675,9 @@ async def send_artifacts_back(client, from_user, context_token, artifacts) -> No
         allowed_root = session_dir
     elif backend == "dsh":
         # dsh runs with cwd=session_dir (per-user workspace); artifacts are
-        # files the model created there. DSH_HOME sessions live outside the
-        # per-user tree (machine-wide ~/.dsh), so they never match anyway.
+        # files the model created there. Session transcripts live at machine-wide
+        # $DSH_HOME/sessions/ (outside per-user tree) and are cleaned by cutoff,
+        # so they never match anyway.
         allowed_root = session_dir
     else:
         # agy writes to .gemini/antigravity-cli/scratch under session_dir
@@ -1277,7 +1278,7 @@ async def _safe_process_message(client: ILinkClient, msg: dict) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(prog="wechatbridge", description="Bridge WeChat messages to agy, Grok Build, or Codex CLIs — text/image/file/voice in, CLI replies and generated files back.")
+    parser = argparse.ArgumentParser(prog="wechatbridge", description="Bridge WeChat messages to agy, Grok Build, Codex, or dsh CLIs — text/image/file/voice in, CLI replies and generated files back.")
     parser.add_argument("--version", action="version", version=f"wechatbridge {__version__}")
     parser.parse_args()
     logger.info("wechatbridge v%s 启动 (backend=%s, instance=%s)", __version__, config.backend, config.instance)

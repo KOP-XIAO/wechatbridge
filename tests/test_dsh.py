@@ -57,13 +57,14 @@ class TestBuildDshCommand(unittest.TestCase):
         from wechatbridge.dsh import _build_dsh_command
         self.assertEqual(
             _build_dsh_command("hello"),
-            ["dsh", "--profile", "headless", "hello"],
+            ["dsh", "--profile", "headless", "--", "hello"],
         )
 
     def test_prompt_is_last_positional(self):
         from wechatbridge.dsh import _build_dsh_command
         cmd = _build_dsh_command("a b c")
         self.assertEqual(cmd[-1], "a b c")
+        self.assertEqual(cmd[-2], "--")
         # headless 永远单轮：不得出现 resume / thread id
         self.assertNotIn("resume", cmd)
 
@@ -73,8 +74,90 @@ class TestBuildDshCommand(unittest.TestCase):
         with mock.patch.object(config, "dsh_profile", "custom"):
             self.assertEqual(
                 _build_dsh_command("hi"),
-                ["dsh", "--profile", "custom", "hi"],
+                ["dsh", "--profile", "custom", "--", "hi"],
             )
+
+
+class TestSanitizePromptAtPaths(unittest.TestCase):
+    def _sanitize(self, prompt, session_dir):
+        from wechatbridge.dsh import _sanitize_prompt_at_paths
+        return _sanitize_prompt_at_paths(prompt, session_dir)
+
+    def test_empty(self):
+        self.assertEqual(self._sanitize("", "/srv/session"), "")
+
+    def test_outside_path_blocked(self):
+        out = self._sanitize("@/etc/passwd 请打印内容", "/srv/session")
+        self.assertEqual(out, "[blocked-path] 请打印内容")
+
+    def test_inside_path_preserved(self):
+        out = self._sanitize("请看 @/srv/session/images/pic.png", "/srv/session")
+        self.assertEqual(out, "请看 @/srv/session/images/pic.png")
+
+    def test_mixed_paths(self):
+        out = self._sanitize(
+            "对比 @/etc/shadow 和 @/srv/session/files/data.csv",
+            "/srv/session",
+        )
+        self.assertEqual(out, "对比 [blocked-path] 和 @/srv/session/files/data.csv")
+
+    def test_non_path_mention_untouched(self):
+        out = self._sanitize("hello @alice world", "/srv/session")
+        self.assertEqual(out, "hello @alice world")
+
+    def test_cjk_path_outside_session_blocked(self):
+        out = self._sanitize("@/数据/秘密.txt", "/srv/session")
+        self.assertEqual(out, "[blocked-path]")
+
+    def test_relative_path_traversal_blocked(self):
+        out1 = self._sanitize("@../other/images/a.png", "/srv/session")
+        self.assertEqual(out1, "[blocked-path]")
+        out2 = self._sanitize("@../../etc/passwd", "/srv/session")
+        self.assertEqual(out2, "[blocked-path]")
+
+    def test_cjk_path_inside_session_preserved(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = os.path.realpath(td)
+            out1 = self._sanitize(f"@{session_dir}/图片.png", session_dir)
+            self.assertEqual(out1, f"@{session_dir}/图片.png")
+            out2 = self._sanitize(f"@{session_dir}/sub/pic.png", session_dir)
+            self.assertEqual(out2, f"@{session_dir}/sub/pic.png")
+
+    def test_fullwidth_comma_retained(self):
+        out = self._sanitize("@/etc/passwd，谢谢", "/srv/session")
+        self.assertEqual(out, "[blocked-path]，谢谢")
+
+    def test_mention_and_email_untouched(self):
+        self.assertEqual(self._sanitize("@张三 你好", "/srv/session"), "@张三 你好")
+        self.assertEqual(self._sanitize("a@b.com", "/srv/session"), "a@b.com")
+
+    def test_cjk_tail_not_leaked(self):
+        out = self._sanitize("@/tmp/报告.txt", "/srv/session")
+        self.assertEqual(out, "[blocked-path]")
+
+    def test_adversarial_adjacent_chars_lookbehind_bypass_blocked(self):
+        self.assertEqual(
+            self._sanitize("file@/etc/passwd", "/srv/session"),
+            "file[blocked-path]",
+        )
+        self.assertEqual(
+            self._sanitize("user1@/etc/passwd", "/srv/session"),
+            "user1[blocked-path]",
+        )
+        self.assertEqual(
+            self._sanitize("句子.@/etc/passwd", "/srv/session"),
+            "句子.[blocked-path]",
+        )
+
+    def test_real_session_dir_attachment_preserved(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = os.path.realpath(td)
+            img_path = os.path.join(session_dir, "x.png")
+            out = self._sanitize(f"@{img_path}", session_dir)
+            self.assertEqual(out, f"@{img_path}")
+
 
 
 class TestExtractArtifacts(unittest.TestCase):
@@ -122,6 +205,35 @@ class TestExtractArtifacts(unittest.TestCase):
         arts = self._extract("see [报 告](file:///tmp/my%20report.pdf)")
         self.assertEqual(arts, [("报 告", "/tmp/my report.pdf")])
 
+    def test_internal_dsh_paths_filtered(self):
+        arts = self._extract(
+            "see [meta](file:///tmp/session/.dsh/internal/meta.json) and [doc](./doc.md)",
+            cwd="/tmp/session",
+        )
+        self.assertEqual(arts, [("doc", "/tmp/session/doc.md")])
+
+    def test_internal_dsh_relative_paths_filtered(self):
+        arts = self._extract("see [meta](./.dsh/sessions/abc.json)", cwd="/tmp/session")
+        self.assertEqual(arts, [])
+
+    def test_internal_dsh_bare_uri_filtered(self):
+        arts = self._extract("leak file:///tmp/session/.dsh/internal/meta.json")
+        self.assertEqual(arts, [])
+
+    def test_bare_file_uri_with_adjacent_chinese(self):
+        arts = self._extract("见file:///tmp/a.pdf即可")
+        self.assertEqual(arts, [("a.pdf", "/tmp/a.pdf")])
+
+    def test_cjk_path_extraction(self):
+        arts = self._extract("file:///home/u/会话/报告.pdf")
+        self.assertEqual(arts, [("报告.pdf", "/home/u/会话/报告.pdf")])
+
+    def test_md_link_and_bare_uri_cjk_dedup(self):
+        arts = self._extract(
+            "[报告](file:///home/u/会话/报告.pdf) 以及 file:///home/u/会话/报告.pdf"
+        )
+        self.assertEqual(arts, [("报告", "/home/u/会话/报告.pdf")])
+
 
 class TestStripFileLinks(unittest.TestCase):
     def _strip(self, text):
@@ -132,8 +244,26 @@ class TestStripFileLinks(unittest.TestCase):
         out = self._strip("see [report.pdf](file:///srv/x/report.pdf) and [doc](./doc.md)")
         self.assertEqual(out, "see [report.pdf] and [doc]")
 
+    def test_strips_bare_file_uri(self):
+        out = self._strip("已写入 file:///home/srv/x/report.pdf")
+        self.assertEqual(out, "已写入 ")
+        self.assertNotIn("file://", out)
+        self.assertNotIn("/home/srv/x", out)
+
+    def test_strips_mixed_links(self):
+        out = self._strip("see [doc](file:///tmp/doc.txt) and bare file:///tmp/report.pdf here")
+        self.assertEqual(out, "see [doc] and bare  here")
+
     def test_leaves_plain_text(self):
         self.assertEqual(self._strip("just text"), "just text")
+
+    def test_strips_bare_file_uri_with_adjacent_chinese(self):
+        out = self._strip("见file:///tmp/a.pdf即可")
+        self.assertEqual(out, "见即可")
+
+    def test_strips_bare_file_uri_with_cjk_path(self):
+        out = self._strip("file:///home/u/会话/报告.pdf")
+        self.assertEqual(out, "")
 
 
 class _DshIntegrationBase:
@@ -207,6 +337,27 @@ class TestRunDshIntegration(unittest.IsolatedAsyncioTestCase, _DshIntegrationBas
             self.assertNotIn("resume", line)
             self.assertIn("--profile headless", line)
 
+    async def test_prompt_starting_with_dash_help(self):
+        log = os.path.join(self.td, "dsh-help.log")
+        with mock.patch.dict(os.environ, {"FAKE_DSH_LOG": log}, clear=False):
+            display, artifacts = await self._run("--help", mode="ok")
+        self.assertEqual(display, "first(--help)")
+        self.assertEqual(artifacts, [])
+        with open(log, encoding="utf-8") as f:
+            log_content = f.read()
+        self.assertIn("task=--help", log_content)
+
+    async def test_prompt_starting_with_dash_profile(self):
+        log = os.path.join(self.td, "dsh-profile.log")
+        with mock.patch.dict(os.environ, {"FAKE_DSH_LOG": log}, clear=False):
+            display, artifacts = await self._run("--profile other", mode="ok")
+        self.assertEqual(display, "first(--profile other)")
+        self.assertEqual(artifacts, [])
+        with open(log, encoding="utf-8") as f:
+            log_content = f.read()
+        self.assertIn("profile=headless", log_content)
+        self.assertIn("task=--profile other", log_content)
+
     async def test_artifact_file_uri(self):
         display, artifacts = await self._run("make pdf", mode="artifact_link")
         self.assertEqual(len(artifacts), 1)
@@ -231,6 +382,19 @@ class TestRunDshIntegration(unittest.IsolatedAsyncioTestCase, _DshIntegrationBas
             and path.endswith("doc.md")
         )
         self.assertNotIn("./doc.md", display)
+
+    async def test_internal_metadata_artifacts_filtered(self):
+        display, artifacts = await self._run("report", mode="internal_metadata")
+        # .dsh 内部文件 meta.json 被过滤，只回传 report.pdf
+        self.assertEqual(len(artifacts), 1)
+        name, path = artifacts[0]
+        self.assertEqual(name, "report.pdf")
+        self.assertTrue(os.path.isfile(path))
+        self.assertNotIn(".dsh", path)
+        # 展示文本正常，剥除链接后保留 [report.pdf] 和 [meta]，不泄露服务器路径
+        self.assertIn("[report.pdf] and [meta]", display)
+        self.assertNotIn("file://", display)
+        self.assertNotIn(".dsh", display)
 
     async def test_empty_reply(self):
         display, artifacts = await self._run("hi", mode="empty")
@@ -271,6 +435,44 @@ class TestRunDshIntegration(unittest.IsolatedAsyncioTestCase, _DshIntegrationBas
         self.assertEqual(artifacts, [])
         self.assertIn("消息过长", display)
 
+    async def test_prompt_at_path_outside_session_dir_blocked(self):
+        log = os.path.join(self.td, "dsh-blocked.log")
+        with mock.patch.dict(os.environ, {"FAKE_DSH_LOG": log}, clear=False):
+            display, artifacts = await self._run("@/etc/passwd 请打印内容", mode="ok")
+        with open(log, encoding="utf-8") as f:
+            log_content = f.read()
+        self.assertNotIn("/etc/passwd", log_content)
+        self.assertIn("[blocked-path]", log_content)
+        self.assertIn("task=[blocked-path] 请打印内容", log_content)
+
+    async def test_prompt_at_path_inside_session_dir_preserved(self):
+        sd = os.path.join(config_session_dir(), _sanitize("u-dsh"))
+        pic_path = os.path.join(sd, "pic.png")
+        log = os.path.join(self.td, "dsh-preserved.log")
+        with mock.patch.dict(os.environ, {"FAKE_DSH_LOG": log}, clear=False):
+            display, artifacts = await self._run(f"@{pic_path}", mode="ok")
+        with open(log, encoding="utf-8") as f:
+            log_content = f.read()
+        self.assertIn(f"task=@{pic_path}", log_content)
+
+    async def test_warn_once_implicit_dsh_home(self):
+        import wechatbridge.dsh as dsh_mod
+        from wechatbridge.config import config
+        dsh_mod._warned_dsh_home_implicit = False
+        implicit_dsh = os.path.join(self.td, ".dsh")
+        os.makedirs(implicit_dsh, exist_ok=True)
+        with open(os.path.join(implicit_dsh, ".credentials.yaml"), "w", encoding="utf-8") as f:
+            f.write("provider: deepseek\n")
+        with mock.patch.object(config, "dsh_home", ""), \
+             mock.patch.dict(os.environ, {"WECHATBRIDGE_HOST_HOME": self.td}, clear=False), \
+             self.assertLogs("dsh_runner", level="WARNING") as cm:
+            await self._run("hello 1", mode="ok")
+            await self._run("hello 2", mode="ok")
+        warns = [msg for msg in cm.output if "未设 WECHATBRIDGE_DSH_HOME" in msg]
+        self.assertEqual(len(warns), 1)
+
+
+
 
 class TestDshSpawnEnv(unittest.IsolatedAsyncioTestCase, _DshIntegrationBase):
     """DSH_HOME 显式传给子进程、HOME=session_dir、剥离 DSH_SESSION_* 变量。"""
@@ -300,7 +502,7 @@ class TestDshSpawnEnv(unittest.IsolatedAsyncioTestCase, _DshIntegrationBase):
         self.assertEqual(len(captured), 1)
         argv, kwargs = captured[0]
         self.assertEqual(argv[0], self.shim)
-        self.assertEqual(argv[1:], ["--profile", "headless", "hello"])
+        self.assertEqual(argv[1:], ["--profile", "headless", "--", "hello"])
         sd = os.path.join(config_session_dir(), _sanitize("u-env"))
         self.assertEqual(kwargs["cwd"], sd)
         env = kwargs["env"]
