@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from urllib.parse import unquote
 
 from .config import config, host_dsh_home, is_dsh_home_explicit
@@ -190,6 +191,52 @@ _BARE_FILE_URI_RE = re.compile(r"file:///[^\s)\]}>]+")
 _TRAILING_PUNCT_CHARS = "。，！？；、：”’'\"）)]}>》」』〉…,.!?;:"
 
 
+# ---------------------------------------------------------------------------
+# Persistent-session id management (codex-style resume)
+#
+# When WECHATBRIDGE_DSH_RESUME is enabled, each WeChat user owns one dsh
+# session id stored in <session_dir>/dsh_session_id. Every message RESUMES
+# that session (via the dsh-bridge-runner plugin), so context accumulates
+# without a window. /clear deletes the id so the next message starts fresh.
+# ---------------------------------------------------------------------------
+
+_SESSION_ID_FILE = "dsh_session_id"
+
+
+def _session_id_path(user_id: str) -> str:
+    return os.path.join(ensure_session_dir(user_id), _SESSION_ID_FILE)
+
+
+def load_or_create_session_id(user_id: str) -> str:
+    """Return the user's persistent dsh session id, creating one if missing."""
+    path = _session_id_path(user_id)
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                sid = f.read().strip()
+            if sid:
+                return sid
+        sid = f"session-bridge-{uuid.uuid4().hex}"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(sid)
+        return sid
+    except OSError as e:
+        logger.warning("Failed to manage dsh session id for %s: %s", user_id, e)
+        return ""
+
+
+def clear_session_id(user_id: str) -> bool:
+    """Forget the user's persistent session id. True when something was removed."""
+    path = _session_id_path(user_id)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except OSError as e:
+        logger.warning("Failed to clear dsh session id for %s: %s", user_id, e)
+    return False
+
+
 def _parse_bare_file_uri(raw: str) -> tuple[str, str]:
     """Parse bare file:/// URI and separate trailing CJK commentary / punctuation.
 
@@ -350,13 +397,19 @@ def _sanitize_prompt_at_paths(prompt: str, session_dir: str) -> str:
     return _AT_TOKEN_RE.sub(_replace, prompt)
 
 
-def _build_dsh_command(prompt: str) -> list:
+def _build_dsh_command(prompt: str, task_as_env: bool = False) -> list:
     """Build the dsh argv: ``dsh --profile <profile> -- <prompt>``.
 
     The headless profile joins its positionals into one task, so the prompt is
     passed as a single positional preceded by ``--`` to prevent option injection.
-    No continuation flag exists: headless always creates a fresh session.
+
+    In persistent-session mode (``task_as_env=True``) the prompt travels via
+    the ``DSH_BRIDGE_TASK`` environment variable instead — the custom
+    dsh-bridge-runner reads it there, and the session id comes from
+    ``DSH_BRIDGE_SESSION_ID``.
     """
+    if task_as_env:
+        return [config.dsh_binary_path, "--profile", config.dsh_profile]
     return [config.dsh_binary_path, "--profile", config.dsh_profile, "--", prompt]
 
 
@@ -417,21 +470,34 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
 
     first = is_first_message(session_dir, backend="dsh")
 
-    # Bridge-managed long-term memory: inject the user's recent turns so the
-    # fresh headless session still has conversation continuity. The danger gate
-    # above only ever sees the raw user prompt (never the injected context).
-    full_prompt = build_prompt_with_context(prompt, user_id)
-    if len(full_prompt.encode("utf-8", errors="replace")) > _MAX_ARG_BYTES:
-        logger.warning("Full prompt (with memory) too large for argv from user %s; dropping context", user_id)
-        full_prompt = prompt
+    resume_mode = bool(getattr(config, "dsh_resume", False))
+    if resume_mode:
+        # Persistent-session mode (codex-style): one dsh session per WeChat
+        # user, resumed on every message by the dsh-bridge-runner plugin. The
+        # windowed memory injection is skipped — the session itself holds the
+        # full conversation context.
+        session_id = load_or_create_session_id(user_id)
+        safe_prompt = _sanitize_prompt_at_paths(prompt, session_dir)
+        cmd = _build_dsh_command(safe_prompt, task_as_env=True)
+        logger.info(
+            "Running dsh (resume) for user %s: session=%s",
+            user_id, session_id,
+        )
+    else:
+        # Bridge-managed long-term memory: inject the user's recent turns so the
+        # fresh headless session still has conversation continuity. The danger
+        # gate above only ever sees the raw user prompt (never the context).
+        full_prompt = build_prompt_with_context(prompt, user_id)
+        if len(full_prompt.encode("utf-8", errors="replace")) > _MAX_ARG_BYTES:
+            logger.warning("Full prompt (with memory) too large for argv from user %s; dropping context", user_id)
+            full_prompt = prompt
 
-    safe_prompt = _sanitize_prompt_at_paths(full_prompt, session_dir)
-    cmd = _build_dsh_command(safe_prompt)
-
-    logger.info(
-        "Running dsh for user %s (first=%s, memory_chars=%d): %s",
-        user_id, first, len(full_prompt) - len(prompt), " ".join(cmd[:3]) + " ...",
-    )
+        safe_prompt = _sanitize_prompt_at_paths(full_prompt, session_dir)
+        cmd = _build_dsh_command(safe_prompt)
+        logger.info(
+            "Running dsh for user %s (first=%s, memory_chars=%d): %s",
+            user_id, first, len(full_prompt) - len(prompt), " ".join(cmd[:3]) + " ...",
+        )
 
 
     process = None
@@ -444,6 +510,10 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
         env["DSH_HOME"] = _host_dsh_home()
         for k in _DSH_SESSION_ENV_KEYS:
             env.pop(k, None)
+        if resume_mode:
+            # 常驻模式：把任务与持久化会话 id 传给 dsh-bridge-runner 插件
+            env["DSH_BRIDGE_TASK"] = prompt
+            env["DSH_BRIDGE_SESSION_ID"] = session_id
         env["PAGER"] = "cat"
         env["CI"] = "true"
         env["NONINTERACTIVE"] = "1"
@@ -486,7 +556,8 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
             mark_initialized(session_dir, backend="dsh")
 
         # Persist the turn into long-term memory for continuity on next message.
-        if display != EMPTY_REPLY and not is_bridge_formatted_reply(display):
+        # (常驻模式下会话本身持有上下文，无需窗口记忆)
+        if not resume_mode and display != EMPTY_REPLY and not is_bridge_formatted_reply(display):
             append_memory(user_id, prompt, display)
 
         elapsed = time.time() - t0
@@ -525,16 +596,26 @@ async def run_dsh(prompt: str, user_id: str, timeout: int = None) -> tuple[str, 
 
 def _cmd_help() -> str:
     """Build /help response listing dsh-supported slash commands."""
+    resume_mode = bool(getattr(config, "dsh_resume", False))
+    if resume_mode:
+        engine_note = [
+            "- dsh 为**常驻会话模式**：每条消息都在同一个 dsh 会话上继续",
+            "  （类似 codex 的 resume），上下文无限累积、不会忘记之前的指令",
+        ]
+    else:
+        engine_note = [
+            "- dsh 为**单轮会话 + 桥接记忆**：每次调用开启新会话，但会带上",
+            "  你最近的对话记录（默认最近 10 轮），保持连续对话与记忆",
+        ]
     lines = [
         "📋 **wechatbridge 支持指令 (dsh)** 📋",
         "",
         "**引擎说明**",
-        "- dsh 为**单轮会话 + 桥接记忆**：每次调用开启新会话，但会带上",
-        "  你最近的对话记录（默认最近 10 轮），保持连续对话与记忆",
+        *engine_note,
         "- `/backend <agy|grok|codex|dsh>` — 切换助手引擎",
         "",
         "**对话控制**",
-        "- `/clear` 或 `/new` — **清空本用户的对话记忆**，重新开始",
+        "- `/clear` 或 `/new` — **重置对话**（清空记忆并开始全新会话）",
         "",
         "**其他**",
         "- `/help` — 显示本帮助",
@@ -583,12 +664,10 @@ async def handle_dsh_slash_command(text: str, user_id: str) -> str | None:
 
     if cmd in ("/clear", "/new"):
         cleared = clear_memory(user_id)
-        return (
-            "✅ **对话记忆已清空** ✅\n\n"
-            "下次提问将不带任何历史上下文，重新开始。"
-            if cleared
-            else "ℹ️ **当前没有可清空的对话记忆** ℹ️"
-        )
+        cleared_sid = clear_session_id(user_id)
+        if cleared or cleared_sid:
+            return "✅ **对话已重置** ✅\n\n已清空记忆并开始全新会话，下次提问将不带任何历史上下文。"
+        return "ℹ️ **当前没有可清空的对话** ℹ️"
 
     # v1: model / effort / mode / persona are not wired to dsh yet.
     # /agent and /backend are meta-commands handled in main.py.

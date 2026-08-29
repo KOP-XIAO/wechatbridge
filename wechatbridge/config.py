@@ -181,6 +181,14 @@ class AppConfig:
     # Max characters of injected memory context (older turns are dropped first).
     dsh_memory_chars: int = _env_int("WECHATBRIDGE_DSH_MEMORY_CHARS", 6000)
 
+    # True persistent-session mode for the dsh backend (codex-style resume).
+    # Requires the headless profile to mount the dsh-bridge-runner plugin
+    # (reads DSH_BRIDGE_SESSION_ID / DSH_BRIDGE_TASK from the environment).
+    # Each WeChat user keeps one dsh session id; every message RESUMES the same
+    # session, so context accumulates without a window. /clear starts a fresh
+    # session. When enabled, the windowed memory injection above is skipped.
+    dsh_resume: bool = os.getenv("WECHATBRIDGE_DSH_RESUME", "false").lower() == "true"
+
     # Instance name (for multi-instance deployments)
     instance: str = _instance
 

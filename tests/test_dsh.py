@@ -614,9 +614,9 @@ class TestDshSlashCommands(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/backend", out)
 
     async def test_clear_clears_memory(self):
-        # 无记忆时提示没有可清空的
+        # 无记忆/无会话时提示没有可清空的
         out = await self._handle("/clear", user_id="u-clear")
-        self.assertIn("记忆", out)
+        self.assertIn("没有可清空", out)
         # 写入记忆后再清
         from wechatbridge.dsh import append_memory, load_memory
         append_memory("u-clear", "hello", "hi there")
@@ -764,6 +764,90 @@ class TestRunDshMemoryIntegration(unittest.IsolatedAsyncioTestCase, _DshIntegrat
         # 两轮对话 = 4 条（user+assistant × 2）
         self.assertEqual(len(turns), 4)
         self.assertEqual(turns[0]["text"], "第一句")
+
+
+class TestDshResumeMode(unittest.TestCase):
+    """Persistent-session mode (codex-style resume via dsh-bridge-runner)."""
+
+    def setUp(self):
+        from wechatbridge.config import config
+        self.td = tempfile.mkdtemp()
+        self.addCleanup(lambda: _rmtree(self.td))
+        self._patchers = []
+        p = mock.patch.object(config, "session_base_dir", self.td)
+        p.start(); self._patchers.append(p)
+        p2 = mock.patch.object(config, "dsh_resume", True)
+        p2.start(); self._patchers.append(p2)
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+
+    def test_session_id_created_and_persisted(self):
+        from wechatbridge.dsh import clear_session_id, load_or_create_session_id, _session_id_path
+        sid1 = load_or_create_session_id("u-resume")
+        self.assertTrue(sid1.startswith("session-bridge-"))
+        self.assertTrue(os.path.isfile(_session_id_path("u-resume")))
+        sid2 = load_or_create_session_id("u-resume")
+        self.assertEqual(sid1, sid2)  # 同一用户复用同一会话 id
+        self.assertTrue(clear_session_id("u-resume"))
+        sid3 = load_or_create_session_id("u-resume")
+        self.assertNotEqual(sid1, sid3)  # 清空后新建
+
+    def test_build_command_env_mode(self):
+        from wechatbridge.dsh import _build_dsh_command
+        cmd = _build_dsh_command("hi", task_as_env=True)
+        self.assertEqual(cmd, ["dsh", "--profile", "headless"])
+        self.assertNotIn("hi", cmd)
+        cmd2 = _build_dsh_command("hi")
+        self.assertEqual(cmd2[-1], "hi")
+
+
+class TestRunDshResumeIntegration(unittest.IsolatedAsyncioTestCase, _DshIntegrationBase):
+    """In resume mode the bridge passes DSH_BRIDGE_SESSION_ID + DSH_BRIDGE_TASK
+    and reuses one session id across messages (no windowed memory injection)."""
+
+    def setUp(self):
+        self._setUp()
+        from wechatbridge.config import config
+        self._resume_patcher = mock.patch.object(config, "dsh_resume", True)
+        self._resume_patcher.start()
+
+    def tearDown(self):
+        self._resume_patcher.stop()
+        self._tearDown()
+
+    async def test_env_and_session_id_reused(self):
+        from wechatbridge.dsh import load_or_create_session_id
+        log = os.path.join(self.td, "dsh.log")
+        with mock.patch.dict(os.environ, {"FAKE_DSH_LOG": log}, clear=False):
+            await self._run("第一句", mode="ok")
+            await self._run("第二句", mode="ok")
+        with open(log, encoding="utf-8") as f:
+            content = f.read()
+        invocations = content.split("invoked mode=")[1:]
+        self.assertEqual(len(invocations), 2)
+        # 两条消息必须使用同一个会话 id
+        sid = load_or_create_session_id("u-dsh")
+        for inv in invocations:
+            self.assertIn(sid, inv)
+        # env 任务模式：argv 里没有 prompt 文本（fake 把 env 任务并进 args 日志）
+        self.assertIn("第一句", invocations[0])
+        self.assertIn("第二句", invocations[1])
+
+    async def test_no_memory_injection_in_resume_mode(self):
+        from wechatbridge.dsh import _memory_path
+        await self._run("第一句", mode="ok")
+        await self._run("第二句", mode="ok")
+        # 常驻模式下不写窗口记忆文件（会话本身持有上下文）
+        self.assertFalse(os.path.exists(_memory_path("u-dsh")))
+
+    async def test_clear_creates_new_session(self):
+        from wechatbridge.dsh import clear_session_id, load_or_create_session_id
+        sid1 = load_or_create_session_id("u-dsh")
+        self.assertTrue(clear_session_id("u-dsh"))
+        sid2 = load_or_create_session_id("u-dsh")
+        self.assertNotEqual(sid1, sid2)
 
 
 def config_session_dir():

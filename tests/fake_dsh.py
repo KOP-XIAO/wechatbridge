@@ -67,13 +67,15 @@ def main():
             task_args.append(arg)
             i += 1
 
-    prompt = " ".join(task_args)
+    # env 任务优先（常驻会话模式），否则取 argv 位置参数
+    env_task = os.environ.get("DSH_BRIDGE_TASK", "")
+    prompt = env_task if env_task else " ".join(task_args)
 
     log_path = os.environ.get("FAKE_DSH_LOG")
     if log_path:
         try:
             with open(log_path, "a", encoding="utf-8") as lf:
-                lf.write("invoked mode=%s profile=%s task=%s args=%s\n" % (mode, profile, prompt, " ".join(args)))
+                lf.write("invoked mode=%s profile=%s session=%s task=%s args=%s\n" % (mode, profile, os.environ.get("DSH_BRIDGE_SESSION_ID", ""), prompt, " ".join(args)))
         except OSError:
             pass
 
