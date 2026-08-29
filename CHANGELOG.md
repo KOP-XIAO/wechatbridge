@@ -7,6 +7,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 ### Added
 
+- **dsh 后端常驻会话模式**：新增 `WECHATBRIDGE_DSH_RESUME`（默认关）。启用后 headless profile 挂载 `dsh-bridge-runner` 插件，每条消息按 `DSH_BRIDGE_SESSION_ID` **恢复**（`agents.resume`）同一 dsh 会话——上下文无限累积、类似 codex 的 `resume <thread_id>`；`/clear` 删除会话 id 开启全新会话。启用时窗口记忆注入自动跳过。
 - **dsh 后端长时记忆**：headless 每次新建会话，故由桥为每用户保存最近对话（默认最近 10 轮，存于每用户 `dsh_memory.jsonl`）并注入每次提问，跨消息保持连续对话与长期记忆；`/clear`、`/new` 清空该记忆重新开始。新增 `WECHATBRIDGE_DSH_MEMORY_TURNS`（默认 10）与 `WECHATBRIDGE_DSH_MEMORY_CHARS`（默认 6000）配置。危险指令闸门仍只看原始提问，不看不注入的记忆。
 
 ## [1.5.0] - 2026-08-29
