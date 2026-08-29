@@ -158,6 +158,63 @@ class TestSanitizePromptAtPaths(unittest.TestCase):
             out = self._sanitize(f"@{img_path}", session_dir)
             self.assertEqual(out, f"@{img_path}")
 
+    def test_tilde_slash_inside_session_rewritten_to_abs(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = os.path.realpath(td)
+            with open(os.path.join(session_dir, "x.png"), "w") as f:
+                f.write("data")
+            out = self._sanitize("@~/x.png", session_dir)
+            self.assertEqual(out, f"@{session_dir}/x.png")
+
+    def test_tilde_slash_traversal_escape_blocked(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = os.path.realpath(td)
+            out = self._sanitize("@~/../../etc/passwd", session_dir)
+            self.assertEqual(out, "[blocked-path]")
+
+    def test_tilde_slash_nonexistent_inside_session_rewritten_to_abs(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = os.path.realpath(td)
+            out = self._sanitize("@~/nonexistent_file.txt", session_dir)
+            self.assertEqual(out, f"@{session_dir}/nonexistent_file.txt")
+            out_cjk = self._sanitize("@~/不存在.txt", session_dir)
+            self.assertEqual(out_cjk, f"@{session_dir}/不存在.txt")
+
+    def test_tilde_alone_mapped_to_abs(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = os.path.realpath(td)
+            out = self._sanitize("@~", session_dir)
+            self.assertEqual(out, f"@{session_dir}")
+
+    def test_bare_relative_dotdot_escape_blocked(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = os.path.realpath(td)
+            out = self._sanitize("@a/../../userB/x", session_dir)
+            self.assertEqual(out, "[blocked-path]")
+
+    def test_bare_relative_dotdot_inside_session_preserved(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = os.path.realpath(td)
+            sub_dir = os.path.join(session_dir, "sub")
+            os.makedirs(sub_dir, exist_ok=True)
+            with open(os.path.join(session_dir, "ok.txt"), "w") as f:
+                f.write("ok")
+            out = self._sanitize("@sub/../ok.txt", session_dir)
+            self.assertEqual(out, "@sub/../ok.txt")
+
+    def test_bare_filename_without_slash_untouched(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            session_dir = os.path.realpath(td)
+            out = self._sanitize("@a.txt", session_dir)
+            self.assertEqual(out, "@a.txt")
+
 
 
 class TestExtractArtifacts(unittest.TestCase):
@@ -234,6 +291,15 @@ class TestExtractArtifacts(unittest.TestCase):
         )
         self.assertEqual(arts, [("报告", "/home/u/会话/报告.pdf")])
 
+    def test_bare_file_uri_cjk_filename_exists_not_stripped(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            file_path = os.path.join(td, "photo说明")
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("content")
+            arts = self._extract(f"见 file://{file_path} 查看")
+            self.assertEqual(arts, [("photo说明", file_path)])
+
 
 class TestStripFileLinks(unittest.TestCase):
     def _strip(self, text):
@@ -258,12 +324,22 @@ class TestStripFileLinks(unittest.TestCase):
         self.assertEqual(self._strip("just text"), "just text")
 
     def test_strips_bare_file_uri_with_adjacent_chinese(self):
-        out = self._strip("见file:///tmp/a.pdf即可")
+        out = self._strip("见file:///tmp/abc即可")
         self.assertEqual(out, "见即可")
 
     def test_strips_bare_file_uri_with_cjk_path(self):
         out = self._strip("file:///home/u/会话/报告.pdf")
         self.assertEqual(out, "")
+
+    def test_strip_bare_file_uri_cjk_filename_exists_stripped_completely(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            file_path = os.path.join(td, "photo说明")
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write("content")
+            out = self._strip(f"已生成 file://{file_path}")
+            self.assertEqual(out, "已生成 ")
+            self.assertNotIn("说明", out)
 
 
 class _DshIntegrationBase:

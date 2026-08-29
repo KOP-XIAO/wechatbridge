@@ -9,9 +9,19 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/) and
 
 - **dsh 后端**：新增 DeepSeek Harness CLI（`dsh`）作为第四个 CLI 后端（`/backend dsh`）。以 `dsh --profile headless -- <prompt>` 单轮运行，cwd 为每用户会话目录；从输出提取 `file:///` 与 markdown 文件链接作为可回传产物（路径字符白名单避免误吞紧邻中文）；`DSH_HOME` 显式配置时启用专用主目录及自动会话保留清理，未配置时复用宿主 `~/.dsh` 且跳过自动清理；对会话目录外的 `@绝对路径` mention 予以屏蔽拦截（替换为 `[blocked-path]`）；`/help`、`/clear`、`/new` 支持，模型/强度/人格类指令暂返回"暂不支持"。headless 每次新建会话，故为单轮模式。
 
+### Fixed
+
+- **dsh `@~/...` 路径重写为绝对路径**：`_sanitize_prompt_at_paths` 在映射判定通过后将 `@~` 与 `@~/...` 重写为绝对路径 `@<session_dir>/...`，使 dsh 的 `read` 工具可直接读取（dsh `read` 工具不展开 `~`），越界保留替换为 `[blocked-path]`。
+- **dsh 裸相对 `..` 越界路径拦截**：将包含 `/` 且含 `..` 片段的裸相对路径（如 `@a/../../userB/x`）纳入 candidate 处理，经 `session_dir` 判定越界后替换为 `[blocked-path]`，会话界内原样保留。
+- **dsh 裸 `file:///` URI 尾部 CJK 裁剪 exists 兜底**：`_parse_bare_file_uri` 在剥除尾部 CJK 注释前先校验本地路径是否存在；真实存在时整段保留不裁，避免合法中文结尾文件名（如 `photo说明`）被截断导致 not found。
+
+### Documentation
+
+- **README dsh 路径过滤表述与沙箱警告校准**：修正 README / README.zh-CN 中对 dsh mention 过滤的表述（明确为 prompt 文本层的 best-effort 过滤，仅拦截绝对路径与 `~` 开头等越界 mention，非沙箱边界），并将自动执行工具非多租户沙箱的安全警告适用范围扩展至 dsh（模型工具无宿主路径约束）。
+
 ### Tests
 
-- 新增 `tests/test_dsh.py` + `tests/fake_dsh.py`：命令构造、产物提取、成功/失败/超时路径、未登录预检、slash 指令、`/backend dsh` 切换。
+- 新增 `tests/test_dsh.py` + `tests/fake_dsh.py`：命令构造、产物提取、成功/失败/超时路径、未登录预检、slash 指令、`/backend dsh` 切换、`~` 路径展开与绝对路径重写、裸相对 `..` 越界拦截与界内保留、含 CJK 结尾文件名提取与剥除。
 
 ## [1.4.9] - 2026-08-16
 

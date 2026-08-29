@@ -93,6 +93,10 @@ def _parse_bare_file_uri(raw: str) -> tuple[str, str]:
     """
     cleaned = raw.rstrip(_TRAILING_PUNCT_CHARS)
     punct = raw[len(cleaned):]
+    if cleaned.startswith("file://"):
+        full_path = unquote(cleaned[len("file://"):])
+        if full_path.startswith("/") and os.path.exists(full_path):
+            return cleaned, punct
     last_slash = cleaned.rfind("/")
     cjk_kept = ""
     if last_slash != -1:
@@ -181,9 +185,11 @@ _AT_TRAILING_PUNCT = ".,!?;:)>]}'\""
 def _sanitize_prompt_at_paths(prompt: str, session_dir: str) -> str:
     """Replace @<path> mentions pointing outside session_dir with [blocked-path].
 
-    Recognizes @ tokens (ASCII, CJK, relative ./ and ../, ~/ and file://).
+    Recognizes @ tokens (ASCII, CJK, relative ./ and ../, ~/ and file://, and
+    bare relative paths containing .. segments).
     Path candidates outside realpath(session_dir) are replaced with [blocked-path].
-    Legitimate attachments under session_dir and non-path @mentions are preserved intact.
+    Legitimate attachments under session_dir and non-path @mentions are preserved intact,
+    while ~ and ~/ paths under session_dir are rewritten to their absolute forms.
 
     Known limitation:
       Paths containing spaces are truncated at the space by token splitting
@@ -199,10 +205,13 @@ def _sanitize_prompt_at_paths(prompt: str, session_dir: str) -> str:
 
         candidate = clean_token
         # Determine whether token is a path candidate
+        parts = candidate.split("/")
         is_candidate = (
             candidate.startswith(("/", "./", "../", "~/"))
+            or candidate == "~"
             or "://" in candidate
             or candidate.startswith("file:")
+            or ("/" in candidate and ".." in parts)
         )
         if not is_candidate:
             return m.group(0)
@@ -214,15 +223,22 @@ def _sanitize_prompt_at_paths(prompt: str, session_dir: str) -> str:
         elif p.startswith("file:"):
             p = p[len("file:"):]
 
-        if p.startswith("~"):
-            p = os.path.expanduser(p)
+        is_tilde = False
+        if p == "~":
+            p = session_dir
+            is_tilde = True
+        elif p.startswith("~/"):
+            p = os.path.join(session_dir, p[2:])
+            is_tilde = True
 
         if not os.path.isabs(p):
             target_path = os.path.normpath(os.path.join(session_dir, p))
         else:
-            target_path = p
+            target_path = os.path.normpath(p)
 
         if path_is_under(target_path, session_dir):
+            if is_tilde:
+                return "@" + target_path + trailing_punct
             return m.group(0)
         return "[blocked-path]" + trailing_punct
 

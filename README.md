@@ -49,7 +49,7 @@ Per-user switch: `/backend agy`, `/backend grok`, `/backend codex`, or `/backend
 
 - **Single-turn:** the `headless` profile always creates a fresh session per invocation (`session-<uuid>`), so every WeChat message starts a new dsh session. `/clear` / `/new` are accepted but are no-ops, and `/model`, `/fast`, `/planning`, `/persona`, `/add-dir` are not wired yet (they return a short "not supported" notice).
 - Runs `dsh --profile headless -- <prompt>` with `cwd` = the per-user session directory (per-user workspace; model-created files land there and can be sent back via CDN).
-- Image and file attachments are merged into the prompt text as `@/absolute/path` mentions only; whether the `headless` profile reads them has not been verified. The bridge blocks `@/absolute/path` mentions pointing outside the session directory (replaced with `[blocked-path]`).
+- Image and file attachments are merged into the prompt text as `@/absolute/path` mentions. Verified in dsh v0.1.1-rc.2: `headless` passes the prompt text directly to the model without pre-reading or inlining mentions; the model receives system guidance on @-paths and may invoke file tools (e.g. `read`) if needed. The bridge only filters out-of-bounds mentions starting with absolute paths, `~`, or `file://` (`@/abs`, `@~/x`, `@file://`, replaced with `[blocked-path]`), which is best-effort prompt text filtering rather than a sandbox boundary.
 - Auth / profiles are **machine-wide** (`~/.dsh`, same model as grok's machine-wide login): the child's `HOME` points at the per-user session dir, so the bridge always passes `DSH_HOME` explicitly. Set `WECHATBRIDGE_DSH_HOME` to configure a dedicated service home with automatic session retention cleanup; when unset, it reuses the host `~/.dsh` without automatic session cleanup (managed by the operator). `DSH_BIN_PATH`, `DSH_PROFILE`, and `DSH_TIMEOUT` are configurable.
 - Status: implemented from the published `dsh` CLI contract (headless bundle source) plus a fake CLI in the test suite; final acceptance depends on a real `dsh login` + headless run.
 
@@ -256,7 +256,7 @@ Other `/…` commands are either rejected (e.g. `/exit`), reported as unsupporte
 ## Ops & security (what the bridge actually enforces)
 
 - **Whitelist first.** Empty `WECHATBRIDGE_ALLOWED_SENDERS` means anyone who can message the bot can use it.
-- **Auto-approve CLIs.** agy runs with `--dangerously-skip-permissions`; grok with `--always-approve` (unless planning mode). Treat this as trusted-user tooling, not a multi-tenant sandbox.
+- **Auto-approve CLIs.** agy runs with `--dangerously-skip-permissions`; grok with `--always-approve` (unless planning mode); dsh tools run without host path restrictions. Treat this as trusted-user tooling, not a multi-tenant sandbox.
 - **Danger gate is keyword-based**, not full intent understanding. Defaults target concrete patterns (`rm -rf /`, pipe-to-shell, `mkfs`, `format c:`, a few heavy Chinese phrases, …). Everyday wording like bare “delete” is **not** gated. Override list via `WECHATBRIDGE_CONFIRM_KEYWORDS`; approve with `WECHATBRIDGE_CONFIRM_TOKEN` (default `y`), TTL `WECHATBRIDGE_PENDING_TTL`.
 - **Inbound media** is size-capped (default 20 MB), streamed, and CDN hosts are allowlisted. Missing `aes_key` returns a clear error.
 - **Outbound artifacts** only leave the allowed per-user tree (agy: session scratch; grok: under session dir), after `realpath` checks, and only if under `WECHATBRIDGE_MAX_OUTBOUND_BYTES`.

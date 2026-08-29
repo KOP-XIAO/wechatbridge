@@ -49,7 +49,7 @@ WeChatBridge 把微信机器人接到 agentic 编程 CLI（谷歌 agy / Antigrav
 
 - **单轮模式：** `headless` profile 每次调用都新建会话（`session-<uuid>`），所以每条微信消息都会开启全新 dsh 会话。`/clear` / `/new` 接受但无实际作用；`/model`、`/fast`、`/planning`、`/persona`、`/add-dir` 暂未接通（会返回"暂不支持"提示）。
 - 以 `dsh --profile headless -- <提示>` 运行，`cwd` = 每用户会话目录（每用户工作区；模型生成的文件落在那里，可经 CDN 回传）。
-- 图片/文件附件对 dsh 仅以 @绝对路径 文本并入 prompt，headless 是否读取未验证。桥对指向会话目录外的 @绝对路径 mention 进行了拦截屏蔽（替换为 `[blocked-path]`）。
+- 图片/文件附件对 dsh 以 @绝对路径 文本并入 prompt。经 dsh v0.1.1-rc.2 源码验证：`headless` profile 不会在 CLI/运行时层面预读取或内联 @mention 文件，而是将 prompt 作为纯文本直接提交给模型，模型依赖系统提示感知 @ 路径并在需要时自行调用 `read` 等工具；桥仅拦截绝对路径与 ~ 开头的越界 mention（`@/abs`、`@~/x`、`@file://`，替换为 `[blocked-path]`），是 prompt 文本层的 best-effort 过滤，不是沙箱边界。
 - 认证 / profile 为**机器级共享**（`~/.dsh`，与 grok 机器级登录同模型）：子进程 `HOME` 指向每用户会话目录，所以桥总是显式传 `DSH_HOME`。显式设置 `WECHATBRIDGE_DSH_HOME` 时使用专用主目录并开启自动会话保留清理；未设置时复用宿主 `~/.dsh`，不执行自动会话清理，由操作员自行管理。`DSH_BIN_PATH`、`DSH_PROFILE`、`DSH_TIMEOUT` 均可配置。
 - **状态：** 基于已发布的 dsh CLI 契约（headless bundle 源码）与测试用 fake CLI 实现；最终需由真实用户在 `dsh login` + headless 实跑后验收。
 
@@ -256,7 +256,7 @@ launchctl load ~/Library/LaunchAgents/com.wechatbridge.plist
 ## 运维与安全（桥实际管到的）
 
 - **白名单优先。** `WECHATBRIDGE_ALLOWED_SENDERS` 为空 = 能私聊机器人的人都能用。
-- **CLI 自动批准。** agy 带 `--dangerously-skip-permissions`；grok 带 `--always-approve`（planning 模式除外）。只适合可信用户，不是多租户沙箱。
+- **CLI 自动批准。** agy 带 `--dangerously-skip-permissions`；grok 带 `--always-approve`（planning 模式除外）；dsh 的模型工具无宿主路径约束。只适合可信用户，不是多租户沙箱。
 - **危险闸门是关键词匹配**，不是完整意图识别。默认针对具体模式（如 `rm -rf /`、管道进 shell、`mkfs`、`format c:`、少量重型中文句式等）。日常里单独一个「删除」**不会**拦。可用 `WECHATBRIDGE_CONFIRM_KEYWORDS` 自定义；确认口令 `WECHATBRIDGE_CONFIRM_TOKEN`（默认 `y`），等待 `WECHATBRIDGE_PENDING_TTL`。
 - **入站媒体**有大小上限（默认 20 MB）、流式下载、CDN 域名白名单；缺 `aes_key` 会明确报错。
 - **出站产物**只从用户允许目录发出（agy：会话 scratch；grok：会话目录下），经 `realpath` 检查，且不超过 `WECHATBRIDGE_MAX_OUTBOUND_BYTES`。
